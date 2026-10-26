@@ -24,7 +24,10 @@ bool eval_confs(const DeviceModels<T>& models, int model,
 		const DeviceTables<T>& tables, const InterContext<T>& ic,
 		const double v[3], const std::vector<double>& confs,
 		std::vector<double>& e, std::vector<double>& g,
-		std::vector<double>* coords = 0);
+		std::vector<double>* coords = 0, int threads_per_chain = 32);
+
+// threads_per_chain (32, 64 or 128): 32 maximizes throughput with many
+// chains; more threads lower the latency of each chain.
 
 // one Monte Carlo chain: its model, initial (randomized) conf and the state
 // of its random number generator after the randomization
@@ -49,7 +52,8 @@ template<typename T>
 void run_monte_carlo(const DeviceModels<T>& models,
 		const DeviceTables<T>& tables, const InterContext<T>& ic,
 		const MCParams& params, const std::vector<ChainInput>& chains,
-		std::vector<ChainResult>& results, unsigned* progress = 0);
+		std::vector<ChainResult>& results, unsigned* progress = 0,
+		int threads_per_chain = 32);
 
 // quasi_newton::operator() (bfgs) on every conf in place (one warp each);
 // returns the minimized energies.  Uses ic's back end (cache or non_cache).
@@ -57,7 +61,7 @@ template<typename T>
 bool run_bfgs(const DeviceModels<T>& models, const DeviceTables<T>& tables,
 		const InterContext<T>& ic, const MinParams& params, const double v[3],
 		const std::vector<int>& model_of, std::vector<std::vector<double> >& confs,
-		std::vector<double>& e);
+		std::vector<double>& e, int threads_per_chain = 32);
 
 } // namespace gpusmina
 

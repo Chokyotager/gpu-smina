@@ -109,6 +109,8 @@ struct ModelDesc
 	int block_offset, num_blocks; // ConfBlocks: ligands then flex
 	int conf_size, change_size;
 	int heavy_offset, num_heavy; // movable heavy atoms (output coords, within)
+	int nbr_start_offset, nbr_offset; // per-atom pair lists
+	int num_pairs, num_nbr, num_children;
 	int num_ligands, num_flex;
 };
 

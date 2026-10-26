@@ -30,6 +30,11 @@ struct FlatModel
 	std::vector<int> level_start; // num_levels + 1
 	std::vector<Pair<double> > pairs;
 	std::vector<int> list_start; // list 0 = other_pairs, then each ligand
+	// per movable atom, the pairs it takes part in (CSR); each entry packs
+	// (pair index << 3) | (atom is b) | (pair in list 0) << 1 |
+	// (this side counts the pair's energy) << 2
+	std::vector<int> nbr_start;
+	std::vector<int> nbr;
 	std::vector<ConfBlock> blocks; // ligands then flex
 	std::vector<int> heavy; // movable non-hydrogen atoms
 	int conf_size = 0, change_size = 0;

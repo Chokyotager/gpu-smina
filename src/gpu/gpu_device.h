@@ -106,17 +106,18 @@ class DeviceModels
 {
 	DevBuf desc, atom_type, atom_charge, atom_local, atom_frame, init_coords,
 			inflex_coords, frames, init_frame_origin, children, level_frames,
-			level_start, pairs, list_start, blocks, heavy;
+			level_start, pairs, list_start, blocks, heavy, nbr_start, nbr;
 public:
 	DevModels<T> dev;
 	std::vector<ModelDesc> host_desc;
-	int max_movable, max_frames, max_list, max_change, max_conf, max_heavy;
+	int max_movable, max_frames, max_list, max_change, max_conf, max_heavy,
+			max_pairs;
 	void upload(const std::vector<const FlatModel*>& models);
 };
 
 // per-warp scratch sizing for EvalScratch (in elements of T)
 ScratchOffsets scratch_layout(int max_movable, int max_frames, int max_list,
-		bool ordered);
+		int max_pairs, bool ordered);
 
 } // namespace gpusmina
 

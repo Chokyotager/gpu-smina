@@ -85,6 +85,8 @@ struct ModelView
 	const int* list_start;
 	const ConfBlock* blocks;
 	const int* heavy;
+	const int* nbr_start;
+	const int* nbr;
 };
 
 // per-warp scratch (global or shared memory)
@@ -117,7 +119,8 @@ struct InterContext
 struct ScratchOffsets
 {
 	int coords, forces, frame_origin, frame_q, frame_m, frame_axis, frame_ft,
-			pair_buf, total;
+			total; // hot part
+	int pair_total; // pair buffer, allocated separately
 };
 
 // all models of a batch: per-model descriptors plus concatenated arrays
@@ -141,6 +144,8 @@ struct DevModels
 	const int* list_start;
 	const ConfBlock* blocks;
 	const int* heavy;
+	const int* nbr_start;
+	const int* nbr;
 };
 
 } // namespace gpusmina

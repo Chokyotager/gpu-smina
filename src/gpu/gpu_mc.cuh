@@ -1,9 +1,10 @@
 /*
  * Device port of smina's search: bfgs.h (both line searches), mutate.cpp,
  * monte_carlo.cpp (operator() producing the output container) and
- * coords.cpp (add_to_output_container).  One warp runs one chain; lane 0
- * owns the random number generator and the scalar control flow is evaluated
- * identically by all lanes from warp-uniform values.
+ * coords.cpp (add_to_output_container).  One thread group (gpu_group.cuh)
+ * runs one chain; rank 0 owns the random number generator and the scalar
+ * control flow is evaluated identically by all threads from group-uniform
+ * values.
  */
 
 #ifndef SMINA_GPU_MC_CUH
@@ -21,54 +22,49 @@ template<typename T> __device__ __forceinline__ T max_value();
 template<> __device__ __forceinline__ float max_value<float>() { return FLT_MAX; }
 template<> __device__ __forceinline__ double max_value<double>() { return DBL_MAX; }
 
-template<typename T> __device__ __forceinline__ T bcast(T v)
-{
-	return __shfl_sync(FULL_MASK, v, 0);
-}
-
 // scalar_product over the change vectors
-template<typename T, bool ORDERED> __device__ T dot_n(const T* a, const T* b,
-		int n, int lane)
+template<typename T, bool ORDERED, int TPC> __device__ T dot_n(const T* a, const T* b,
+		int n, const Group<TPC>& G)
 {
 	if (ORDERED)
 	{
 		T tmp = 0;
-		if (lane == 0)
+		if (G.rank == 0)
 			for (int i = 0; i < n; i++)
 				tmp += a[i] * b[i];
-		return bcast(tmp);
+		return G.bcast(tmp);
 	}
 	T part = 0;
-	for (int i = lane; i < n; i += 32)
+	for (int i = G.rank; i < n; i += TPC)
 		part += a[i] * b[i];
-	return warp_sum(part);
+	return G.sum(part);
 }
 
-template<typename T> __device__ void copy_n(T* dst, const T* src, int n,
-		int lane)
+template<typename T, int TPC> __device__ void copy_n(T* dst, const T* src, int n,
+		const Group<TPC>& G)
 {
-	for (int i = lane; i < n; i += 32)
+	for (int i = G.rank; i < n; i += TPC)
 		dst[i] = src[i];
-	__syncwarp();
+	G.sync();
 }
 
 // minus_mat_vec_product: out(i) = -sum_j h(i, j) * in(j)
-template<typename T> __device__ void minus_mat_vec(const T* h, const T* in,
-		T* out, int n, int lane)
+template<typename T, int TPC> __device__ void minus_mat_vec(const T* h, const T* in,
+		T* out, int n, const Group<TPC>& G)
 {
-	for (int i = lane; i < n; i += 32)
+	for (int i = G.rank; i < n; i += TPC)
 	{
 		T sum = 0;
 		for (int j = 0; j < n; j++)
 			sum += h[(i < j) ? tri_index(i, j) : tri_index(j, i)] * in[j];
 		out[i] = -sum;
 	}
-	__syncwarp();
+	G.sync();
 }
 
 // conf::increment(change, factor)
-template<typename T> __device__ void conf_increment(const ModelView<T>& mv,
-		T* x, const T* c, T factor, int lane)
+template<typename T, int TPC> __device__ void conf_increment(const ModelView<T>& mv,
+		T* x, const T* c, T factor, const Group<TPC>& G)
 {
 	for (int bi = 0; bi < mv.d.num_blocks; bi++)
 	{
@@ -78,7 +74,7 @@ template<typename T> __device__ void conf_increment(const ModelView<T>& mv,
 		int xt = 0, ct = 0;
 		if (b.is_ligand)
 		{
-			if (lane == 0)
+			if (G.rank == 0)
 			{
 				for (int k = 0; k < 3; k++)
 					xb[k] += factor * cb[k];
@@ -93,14 +89,14 @@ template<typename T> __device__ void conf_increment(const ModelView<T>& mv,
 			xt = 7;
 			ct = 6;
 		}
-		for (int t = lane; t < b.ntors; t += 32)
+		for (int t = G.rank; t < b.ntors; t += TPC)
 		{
 			T& tor = xb[xt + t];
 			tor += normalized_angle(factor * cb[ct + t]);
 			normalize_angle(tor);
 		}
 	}
-	__syncwarp();
+	G.sync();
 }
 
 // quaternion_to_angle (quaternion.cpp)
@@ -160,32 +156,32 @@ struct Objective // quasi_newton_aux
 	}
 };
 
-template<typename T, bool ORDERED> __device__ __forceinline__ T evaluate(
-		const Objective<T>& f, const T* x, T* g, int lane)
+template<typename T, bool ORDERED, int TPC> __device__ __forceinline__ T evaluate(
+		const Objective<T>& f, const T* x, T* g, const Group<TPC>& G)
 {
-	T e = eval_deriv<T, ORDERED>(f.mv, f.tb, f.ic, f.v, x, g, f.ws, lane);
+	T e = eval_deriv<T, ORDERED>(f.mv, f.tb, f.ic, f.v, x, g, f.ws, G);
 #ifdef GPU_TRACE_EVALS
-	if (lane == 0 && blockIdx.x == 0 && threadIdx.x == 0)
+	if (G.rank == 0 && blockIdx.x == 0 && threadIdx.x == 0)
 		printf("GPUEVAL %.17g\n", double(e));
 #endif
 	return e;
 }
 
-template<typename T, bool ORDERED> __device__ T fast_line_search(
+template<typename T, bool ORDERED, int TPC> __device__ T fast_line_search(
 		const Objective<T>& f, int n, const T* x, const T* g, T f0,
-		const T* p, T* x_new, T* g_new, T& f1, int lane)
+		const T* p, T* x_new, T* g_new, T& f1, const Group<TPC>& G)
 {
 	const T c0 = T(0.0001);
 	const int max_trials = 10;
 	const T multiplier = T(0.5);
 	T alpha = 1;
-	const T pg = dot_n<T, ORDERED>(p, g, n, lane);
+	const T pg = dot_n<T, ORDERED>(p, g, n, G);
 	const int conf_size = f.mv.d.conf_size;
 	for (int trial = 0; trial < max_trials; trial++)
 	{
-		copy_n(x_new, x, conf_size, lane);
-		conf_increment(f.mv, x_new, p, alpha, lane);
-		f1 = evaluate<T, ORDERED>(f, x_new, g_new, lane);
+		copy_n(x_new, x, conf_size, G);
+		conf_increment(f.mv, x_new, p, alpha, G);
+		f1 = evaluate<T, ORDERED>(f, x_new, g_new, G);
 		if (f1 - f0 < c0 * alpha * pg)
 			break;
 		alpha *= multiplier;
@@ -193,16 +189,16 @@ template<typename T, bool ORDERED> __device__ T fast_line_search(
 	return alpha;
 }
 
-template<typename T> __device__ void zero_n(T* a, int n, int lane)
+template<typename T, int TPC> __device__ void zero_n(T* a, int n, const Group<TPC>& G)
 {
-	for (int i = lane; i < n; i += 32)
+	for (int i = G.rank; i < n; i += TPC)
 		a[i] = 0;
-	__syncwarp();
+	G.sync();
 }
 
-template<typename T, bool ORDERED> __device__ T accurate_line_search(
+template<typename T, bool ORDERED, int TPC> __device__ T accurate_line_search(
 		const Objective<T>& f, int n, const T* x, const T* g, T f0,
-		const T* p, T* x_new, T* g_new, T& f1, int lane)
+		const T* p, T* x_new, T* g_new, T& f1, const Group<TPC>& G)
 {
 	T a, alpha, alpha2 = 0, alamin, b, disc, f2 = 0;
 	T rhs1, rhs2, slope = 0, test, tmplam = 0;
@@ -210,38 +206,36 @@ template<typename T, bool ORDERED> __device__ T accurate_line_search(
 	const T FIRST = T(1.0);
 	const int conf_size = f.mv.d.conf_size;
 
-	slope = dot_n<T, ORDERED>(g, p, n, lane);
+	slope = dot_n<T, ORDERED>(g, p, n, G);
 	if (slope >= 0)
 	{
-		copy_n(x_new, x, conf_size, lane);
-		zero_n(g_new, n, lane);
+		copy_n(x_new, x, conf_size, G);
+		zero_n(g_new, n, G);
 		return 0;
 	}
 	// test = max_i |p(i)| / max(|x(i)|, 1)
 	T part = 0;
-	for (int i = lane; i < n; i += 32)
+	for (int i = G.rank; i < n; i += TPC)
 	{
 		const T ax = gabs(conf_value(f.mv, x, i));
 		T temp = gabs(p[i]) / ((ax < T(1.0)) ? T(1.0) : ax); // std::max
 		if (temp > part)
 			part = temp;
 	}
-	for (int o = 16; o > 0; o >>= 1)
-		part = fmax(part, __shfl_xor_sync(FULL_MASK, part, o));
-	test = part;
+	test = G.max(part);
 
 	alamin = c_epsilon_fl<T>() / test;
 	alpha = FIRST;
 	for (;;)
 	{
-		copy_n(x_new, x, conf_size, lane);
-		conf_increment(f.mv, x_new, p, alpha, lane);
-		f1 = evaluate<T, ORDERED>(f, x_new, g_new, lane);
+		copy_n(x_new, x, conf_size, G);
+		conf_increment(f.mv, x_new, p, alpha, G);
+		f1 = evaluate<T, ORDERED>(f, x_new, g_new, G);
 
 		if (alpha < alamin)
 		{
-			copy_n(x_new, x, conf_size, lane);
-			zero_n(g_new, n, lane);
+			copy_n(x_new, x, conf_size, G);
+			zero_n(g_new, n, G);
 			return 0;
 		}
 		else if (f1 <= f0 + ALF * alpha * slope)
@@ -285,17 +279,17 @@ template<typename T, bool ORDERED> __device__ T accurate_line_search(
 }
 
 // bfgs_update: returns false when the curvature condition fails
-template<typename T, bool ORDERED> __device__ bool bfgs_update(T* h,
-		const T* p, const T* y, T* minus_hy, const T alpha, int n, int lane)
+template<typename T, bool ORDERED, int TPC> __device__ bool bfgs_update(T* h,
+		const T* p, const T* y, T* minus_hy, const T alpha, int n, const Group<TPC>& G)
 {
-	const T yp = dot_n<T, ORDERED>(y, p, n, lane);
+	const T yp = dot_n<T, ORDERED>(y, p, n, G);
 	if (alpha * yp < c_epsilon_fl<T>())
 		return false;
-	minus_mat_vec(h, y, minus_hy, n, lane);
-	const T yhy = -dot_n<T, ORDERED>(y, minus_hy, n, lane);
+	minus_mat_vec(h, y, minus_hy, n, G);
+	const T yhy = -dot_n<T, ORDERED>(y, minus_hy, n, G);
 	const T r = 1 / (alpha * yp);
 	const int total = n * (n + 1) / 2;
-	for (int k = lane; k < total; k += 32)
+	for (int k = G.rank; k < total; k += TPC)
 	{
 		// k = i + j*(j+1)/2 with i <= j
 		int j = int((sqrtf(8.0f * k + 1) - 1) / 2);
@@ -307,52 +301,53 @@ template<typename T, bool ORDERED> __device__ bool bfgs_update(T* h,
 		h[k] += alpha * r * (minus_hy[i] * p[j] + minus_hy[j] * p[i])
 				+ alpha * alpha * (r * r * yhy + r) * p[i] * p[j];
 	}
-	__syncwarp();
+	G.sync();
 	return true;
 }
 
-template<typename T> __device__ void set_diagonal(T* h, T x, int n, int lane)
+template<typename T, int TPC> __device__ void set_diagonal(T* h, T x, int n, const Group<TPC>& G)
 {
-	for (int i = lane; i < n; i += 32)
+	for (int i = G.rank; i < n; i += TPC)
 		h[tri_index(i, i)] = x;
-	__syncwarp();
+	G.sync();
 }
 
 // bfgs(): x is minimized in place, the final value is returned
-template<typename T, bool ORDERED> __device__ T bfgs(const Objective<T>& f,
-		T* x, const BFGSWork<T>& w, const MinParams& params, int lane)
+template<typename T, bool ORDERED, int TPC> __device__ T bfgs(const Objective<T>& f,
+		T* x, const BFGSWork<T>& w, const MinParams& params, const Group<TPC>& G)
 {
+	PROF_START(tb0);
 	const int n = f.mv.d.change_size;
 	const int conf_size = f.mv.d.conf_size;
-	zero_n(w.h, n * (n + 1) / 2, lane);
-	set_diagonal(w.h, T(1), n, lane);
+	zero_n(w.h, n * (n + 1) / 2, G);
+	set_diagonal(w.h, T(1), n, G);
 
-	T f0 = evaluate<T, ORDERED>(f, x, w.g, lane);
+	T f0 = evaluate<T, ORDERED>(f, x, w.g, G);
 	const T f_orig = f0;
-	copy_n(w.g_orig, w.g, n, lane);
-	copy_n(w.x_orig, x, conf_size, lane);
+	copy_n(w.g_orig, w.g, n, G);
+	copy_n(w.x_orig, x, conf_size, G);
 
 	for (unsigned step = 0; step < params.maxiters; step++)
 	{
-		minus_mat_vec(w.h, w.g, w.p, n, lane);
+		minus_mat_vec(w.h, w.g, w.p, n, G);
 		T f1 = 0;
 		T alpha;
 		if (params.accurate_line)
 			alpha = accurate_line_search<T, ORDERED>(f, n, x, w.g, f0, w.p,
-					w.x_new, w.g_new, f1, lane);
+					w.x_new, w.g_new, f1, G);
 		else
 			alpha = fast_line_search<T, ORDERED>(f, n, x, w.g, f0, w.p,
-					w.x_new, w.g_new, f1, lane);
+					w.x_new, w.g_new, f1, G);
 		if (alpha == 0)
 			break;
 		// y = g_new - g
-		for (int i = lane; i < n; i += 32)
+		for (int i = G.rank; i < n; i += TPC)
 			w.y[i] = w.g_new[i] - w.g[i];
-		__syncwarp();
+		G.sync();
 
 		const T prevf0 = f0;
 		f0 = f1;
-		copy_n(x, w.x_new, conf_size, lane);
+		copy_n(x, w.x_new, conf_size, G);
 
 		if (params.early_term)
 		{
@@ -361,33 +356,34 @@ template<typename T, bool ORDERED> __device__ T bfgs(const Objective<T>& f,
 				break;
 		}
 
-		copy_n(w.g, w.g_new, n, lane);
-		const T gradnormsq = dot_n<T, ORDERED>(w.g, w.g, n, lane);
+		copy_n(w.g, w.g_new, n, G);
+		const T gradnormsq = dot_n<T, ORDERED>(w.g, w.g, n, G);
 		if (!(gradnormsq >= T(1e-4)))
 			break;
 
 		if (step == 0)
 		{
-			const T yy = dot_n<T, ORDERED>(w.y, w.y, n, lane);
+			const T yy = dot_n<T, ORDERED>(w.y, w.y, n, G);
 			if (gabs(yy) > c_epsilon_fl<T>())
-				set_diagonal(w.h, alpha * dot_n<T, ORDERED>(w.y, w.p, n, lane) / yy,
-						n, lane);
+				set_diagonal(w.h, alpha * dot_n<T, ORDERED>(w.y, w.p, n, G) / yy,
+						n, G);
 		}
-		bfgs_update<T, ORDERED>(w.h, w.p, w.y, w.minus_hy, alpha, n, lane);
+		bfgs_update<T, ORDERED>(w.h, w.p, w.y, w.minus_hy, alpha, n, G);
 	}
 
 	if (!(f0 <= f_orig))
 	{
 		f0 = f_orig;
-		copy_n(x, w.x_orig, conf_size, lane);
-		copy_n(w.g, w.g_orig, n, lane);
+		copy_n(x, w.x_orig, conf_size, G);
+		copy_n(w.g, w.g_orig, n, G);
 	}
+	PROF_ADD(PROF_BFGS_TOTAL, tb0);
 	return f0;
 }
 
 ////////////////////////////// mutation //////////////////////////////
 
-// random_inside_sphere (lane 0 only)
+// random_inside_sphere (rank 0 only)
 __device__ inline void random_inside_sphere(MTState& s, double out[3])
 {
 	for (;;)
@@ -421,7 +417,7 @@ template<typename T> __device__ T gyration_radius(const ModelView<T>& mv,
 	return (counter > 0) ? gsqrt(acc / T(counter)) : T(0);
 }
 
-// mutate_conf (lane 0 only; caller syncs)
+// mutate_conf (rank 0 only; caller syncs)
 template<typename T> __device__ void mutate_conf(const ModelView<T>& mv,
 		T* c, T amplitude, const EvalScratch<T>& ws, MTState& rng)
 {
@@ -489,9 +485,9 @@ template<typename T> __device__ void mutate_conf(const ModelView<T>& mv,
 ////////////////////////////// output container //////////////////////////////
 
 // add_to_output_container: entries are kept sorted through `order`
-template<typename T, bool ORDERED> __device__ void add_to_output(
+template<typename T, bool ORDERED, int TPC> __device__ void add_to_output(
 		const ModelView<T>& mv, const ChainView<T>& cv, const T* conf, T e,
-		const T* coords, T min_rmsd, int max_size, int lane)
+		const T* coords, T min_rmsd, int max_size, const Group<TPC>& G)
 {
 	const int nh = mv.d.num_heavy;
 	const int csz = mv.d.conf_size;
@@ -499,7 +495,7 @@ template<typename T, bool ORDERED> __device__ void add_to_output(
 	// find_closest: smallest rmsd_upper_bound, first index on ties
 	T best = max_value<T>();
 	int besti = count;
-	for (int k = lane; k < count; k += 32)
+	for (int k = G.rank; k < count; k += TPC)
 	{
 		const T* oc = cv.out_coords + size_t(cv.order[k]) * 3 * nh;
 		T acc = 0;
@@ -512,16 +508,7 @@ template<typename T, bool ORDERED> __device__ void add_to_output(
 			besti = k;
 		}
 	}
-	for (int o = 16; o > 0; o >>= 1)
-	{
-		T ob = __shfl_xor_sync(FULL_MASK, best, o);
-		int oi = __shfl_xor_sync(FULL_MASK, besti, o);
-		if (ob < best || (ob == best && oi < besti))
-		{
-			best = ob;
-			besti = oi;
-		}
-	}
+	G.argmin(best, besti);
 	int slot = -1; // storage slot to overwrite
 	if (besti < count && best < min_rmsd)
 	{
@@ -533,19 +520,19 @@ template<typename T, bool ORDERED> __device__ void add_to_output(
 		if (count < max_size)
 		{
 			slot = count; // storage slots are allocated in order
-			if (lane == 0)
+			if (G.rank == 0)
 				cv.order[count] = count;
 			count++;
 		}
 		else if (count > 0 && e < cv.out_e[cv.order[count - 1]])
 			slot = cv.order[count - 1];
 	}
-	__syncwarp();
+	G.sync();
 	if (slot >= 0)
 	{
-		copy_n(cv.out_conf + size_t(slot) * csz, conf, csz, lane);
-		copy_n(cv.out_coords + size_t(slot) * 3 * nh, coords, 3 * nh, lane);
-		if (lane == 0)
+		copy_n(cv.out_conf + size_t(slot) * csz, conf, csz, G);
+		copy_n(cv.out_coords + size_t(slot) * 3 * nh, coords, 3 * nh, G);
+		if (G.rank == 0)
 		{
 			cv.out_e[slot] = e;
 			*cv.count = count;
@@ -564,24 +551,24 @@ template<typename T, bool ORDERED> __device__ void add_to_output(
 			}
 		}
 	}
-	__syncwarp();
+	G.sync();
 }
 
 // model::get_heavy_atom_movable_coords from the current model state
-template<typename T> __device__ void heavy_coords(const ModelView<T>& mv,
-		const EvalScratch<T>& ws, T* out, int lane)
+template<typename T, int TPC> __device__ void heavy_coords(const ModelView<T>& mv,
+		const EvalScratch<T>& ws, T* out, const Group<TPC>& G)
 {
-	for (int k = lane; k < mv.d.num_heavy; k += 32)
+	for (int k = G.rank; k < mv.d.num_heavy; k += TPC)
 	{
 		const int a = mv.heavy[k];
 		out[3 * k] = ws.coords[3 * a];
 		out[3 * k + 1] = ws.coords[3 * a + 1];
 		out[3 * k + 2] = ws.coords[3 * a + 2];
 	}
-	__syncwarp();
+	G.sync();
 }
 
-// metropolis_accept (lane 0 only)
+// metropolis_accept (rank 0 only)
 template<typename T> __device__ bool metropolis_accept(T old_f, T new_f,
 		double temperature, MTState& rng)
 {
@@ -594,10 +581,10 @@ template<typename T> __device__ bool metropolis_accept(T old_f, T new_f,
 
 // monte_carlo::operator() for one chain; the chain's initial conf (already
 // randomized on the host) is in cv.tmp
-template<typename T, bool ORDERED> __device__ void monte_carlo_chain(
+template<typename T, bool ORDERED, int TPC> __device__ void monte_carlo_chain(
 		const ModelView<T>& mv, const DevTables<T>& tb,
 		const InterContext<T>& ic, const MCParams& prm, const ChainView<T>& cv,
-		EvalScratch<T>& ws, MTState& rng, int lane, unsigned* progress)
+		EvalScratch<T>& ws, MTState& rng, const Group<TPC>& G, unsigned* progress)
 {
 	const T hunt_cap[3] = {T(prm.hunt_cap[0]), T(prm.hunt_cap[1]),
 			T(prm.hunt_cap[2])};
@@ -607,43 +594,49 @@ template<typename T, bool ORDERED> __device__ void monte_carlo_chain(
 	const Objective<T> f_auth(mv, tb, ic, authentic_v, ws);
 	const int csz = mv.d.conf_size;
 
+	PROF_START(tmc);
 	T tmp_e = 0;
 	T best_e = max_value<T>();
-	if (lane == 0)
+	if (G.rank == 0)
 		*cv.count = 0;
-	__syncwarp();
+	G.sync();
 
 	for (unsigned step = 0; step < prm.num_steps; step++)
 	{
-		if (progress && lane == 0)
+		if (progress && G.rank == 0)
 			atomicAdd(progress, 1u);
-		copy_n(cv.cand, cv.tmp, csz, lane);
-		if (lane == 0)
+		PROF_START(tm);
+		copy_n(cv.cand, cv.tmp, csz, G);
+		if (G.rank == 0)
 			mutate_conf(mv, cv.cand, T(prm.mutation_amplitude), ws, rng);
-		__syncwarp();
-		const T cand_e = bfgs<T, ORDERED>(f_hunt, cv.cand, cv.work, prm.min, lane);
+		G.sync();
+		PROF_ADD(PROF_MUTATE, tm);
+		const T cand_e = bfgs<T, ORDERED>(f_hunt, cv.cand, cv.work, prm.min, G);
 		int accept = 0;
-		if (lane == 0)
+		if (G.rank == 0)
 			accept = (step == 0)
 					|| metropolis_accept(tmp_e, cand_e, prm.temperature, rng);
-		accept = __shfl_sync(FULL_MASK, accept, 0);
+		accept = G.bcast(accept);
 		if (accept)
 		{
-			copy_n(cv.tmp, cv.cand, csz, lane);
+			copy_n(cv.tmp, cv.cand, csz, G);
 			tmp_e = cand_e;
-			set_conf(mv, cv.tmp, ws, lane);
+			set_conf(mv, cv.tmp, ws, G);
 			if (tmp_e < best_e || *cv.count < prm.num_saved_mins)
 			{
-				tmp_e = bfgs<T, ORDERED>(f_auth, cv.tmp, cv.work, prm.min, lane);
-				set_conf(mv, cv.tmp, ws, lane);
-				heavy_coords(mv, ws, cv.coords, lane);
+				tmp_e = bfgs<T, ORDERED>(f_auth, cv.tmp, cv.work, prm.min, G);
+				set_conf(mv, cv.tmp, ws, G);
+				PROF_START(to);
+				heavy_coords(mv, ws, cv.coords, G);
 				add_to_output<T, ORDERED>(mv, cv, cv.tmp, tmp_e, cv.coords,
-						T(prm.min_rmsd), prm.num_saved_mins, lane);
+						T(prm.min_rmsd), prm.num_saved_mins, G);
+				PROF_ADD(PROF_OUTPUT, to);
 				if (tmp_e < best_e)
 					best_e = tmp_e;
 			}
 		}
 	}
+	PROF_ADD(PROF_MC_TOTAL, tmc);
 }
 
 } // namespace gpusmina

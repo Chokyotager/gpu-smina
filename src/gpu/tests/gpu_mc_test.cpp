@@ -68,7 +68,7 @@ template<typename T>
 double run_gpu(model& m, const FlatModel& fm, const FlatTables& ft,
 		const DeviceGrids<T>& grids, const parallel_mc& par,
 		const std::vector<int>& seeds, const vec& c1, const vec& c2,
-		std::vector<output_container>& out)
+		std::vector<output_container>& out, int tpc)
 {
 	std::vector<const FlatModel*> fms(1, &fm);
 	DeviceModels<T> dmodels;
@@ -86,7 +86,7 @@ double run_gpu(model& m, const FlatModel& fm, const FlatTables& ft,
 	MCParams prm = mc_params(par.mc);
 	std::vector<ChainResult> res;
 	boost::timer::cpu_timer timer;
-	run_monte_carlo(dmodels, dtables, ic, prm, chains, res);
+	run_monte_carlo(dmodels, dtables, ic, prm, chains, res, 0, tpc);
 	double secs = timer.elapsed().wall / 1e9;
 	out.clear();
 	out.resize(seeds.size());
@@ -117,7 +117,7 @@ int main(int argc, char* argv[])
 	std::string recname = argv[1], ligname = argv[2];
 	std::string scoring, approx = "linear", flexres;
 	std::vector<int> steps = parse_list("1,10,100");
-	int tasks = 4, seed = 42;
+	int tasks = 4, seed = 42, tpc = 32;
 	double factor = 32;
 	for (int i = 3; i + 1 < argc; i += 2)
 	{
@@ -126,6 +126,8 @@ int main(int argc, char* argv[])
 			steps = parse_list(argv[i + 1]);
 		else if (o == "--tasks")
 			tasks = atoi(argv[i + 1]);
+		else if (o == "--tpc")
+			tpc = atoi(argv[i + 1]);
 		else if (o == "--seed")
 			seed = atoi(argv[i + 1]);
 		else if (o == "--scoring")
@@ -198,6 +200,14 @@ int main(int argc, char* argv[])
 	for (int i = 0; i < tasks; i++)
 		seeds.push_back(random_int(0, 1000000, master));
 
+	{
+		int maxdeg = 0;
+		for (int i = 0; i < fm.num_movable; i++)
+			maxdeg = std::max(maxdeg, fm.nbr_start[i + 1] - fm.nbr_start[i]);
+		std::cout << "pairs " << fm.pairs.size() << "  nbr entries "
+				<< fm.nbr.size() << "  max per atom " << maxdeg << "  frames "
+				<< fm.frames.size() << "  levels " << fm.num_levels() << "\n";
+	}
 	std::cout << "atoms " << m.num_movable_atoms() << "  dof "
 			<< m.get_size().num_degrees_of_freedom() << "  full run "
 			<< full_steps << " steps, bfgs maxiters " << minparm.maxiters << "\n";
@@ -280,6 +290,23 @@ int main(int argc, char* argv[])
 		std::cout << "bfgs fp64: " << same << "/" << cs.size() << " identical\n";
 	}
 
+	if (getenv("GPU_TEST_THROUGHPUT"))
+	{
+		// GPU only: many chains, report chain-steps per second
+		int n = atoi(getenv("GPU_TEST_THROUGHPUT"));
+		par.mc.num_steps = steps[0];
+		rng m2(static_cast<rng::result_type>(seed));
+		std::vector<int> many;
+		for (int i = 0; i < n; i++)
+			many.push_back(random_int(0, 1000000, m2));
+		std::vector<output_container> o;
+		double t = run_gpu(m, fm, ft, g32, par, many, c1, c2, o, tpc);
+		std::cout << n << " chains x " << steps[0] << " steps, tpc " << tpc
+				<< ": " << t << " s, " << n * double(steps[0]) / t
+				<< " chain-steps/s\n";
+		return 0;
+	}
+
 	bool ok = true;
 	for (size_t si = 0; si < steps.size(); si++)
 	{
@@ -294,8 +321,8 @@ int main(int argc, char* argv[])
 		}
 		double cpu_s = timer.elapsed().wall / 1e9;
 		std::vector<output_container> o64, o32;
-		double t64 = run_gpu(m, fm, ft, g64, par, seeds, c1, c2, o64);
-		double t32 = run_gpu(m, fm, ft, g32, par, seeds, c1, c2, o32);
+		double t64 = run_gpu(m, fm, ft, g64, par, seeds, c1, c2, o64, tpc);
+		double t32 = run_gpu(m, fm, ft, g32, par, seeds, c1, c2, o32, tpc);
 		Compare c = compare(cpu, o64, fm, 1e-9);
 		Compare d = compare(cpu, o32, fm, 1e-4);
 		double cpu_best = max_fl, g32_best = max_fl;
@@ -305,6 +332,33 @@ int main(int argc, char* argv[])
 				cpu_best = std::min(cpu_best, cpu[i][0].e);
 			if (!o32[i].empty())
 				g32_best = std::min(g32_best, o32[i][0].e);
+		}
+		if (getenv("GPU_TEST_DIST"))
+		{
+			// distribution of per-chain best energies
+			std::vector<double> bc, bg;
+			for (int i = 0; i < tasks; i++)
+			{
+				if (!cpu[i].empty())
+					bc.push_back(cpu[i][0].e);
+				if (!o32[i].empty())
+					bg.push_back(o32[i][0].e);
+			}
+			std::sort(bc.begin(), bc.end());
+			std::sort(bg.begin(), bg.end());
+			std::cout << std::fixed << std::setprecision(2)
+					<< "  best-E quartiles cpu " << bc[0] << " " << bc[bc.size() / 4]
+					<< " " << bc[bc.size() / 2] << " " << bc[3 * bc.size() / 4]
+					<< " " << bc.back() << " | gpu32 " << bg[0] << " "
+					<< bg[bg.size() / 4] << " " << bg[bg.size() / 2] << " "
+					<< bg[3 * bg.size() / 4] << " " << bg.back() << "\n";
+			int pc = 0, pg = 0;
+			for (size_t i = 0; i < bc.size(); i++)
+				pc += bc[i] > -5;
+			for (size_t i = 0; i < bg.size(); i++)
+				pg += bg[i] > -5;
+			std::cout << "  chains with best E > -5: cpu " << pc << "/" << bc.size()
+					<< "  gpu32 " << pg << "/" << bg.size() << "\n";
 		}
 		bool pass = c.identical == c.chains;
 		ok &= pass;

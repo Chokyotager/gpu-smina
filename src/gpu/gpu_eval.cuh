@@ -1,13 +1,13 @@
 /*
- * Warp-cooperative energy + gradient evaluation: a port of
- * model::eval_deriv (model.cpp) with its two interaction back ends,
- * cache::eval_deriv (grid.cpp interpolation) and non_cache::eval_deriv,
- * plus the precalculate_linear / precalculate_splines pair tables.
+ * Cooperative energy + gradient evaluation: a port of model::eval_deriv
+ * (model.cpp) with its two interaction back ends, cache::eval_deriv
+ * (grid.cpp interpolation) and non_cache::eval_deriv, plus the
+ * precalculate_linear / precalculate_splines pair tables.
  *
- * One warp evaluates one conformation.  When ORDERED is true (the double
- * precision validation build) every floating point reduction is performed by
- * a single lane in the CPU's order; otherwise warp-parallel reductions and
- * shared atomics are used.
+ * One thread group (gpu_group.cuh) evaluates one conformation.  When ORDERED
+ * is true (the double precision validation build) every floating point
+ * reduction is performed by rank 0 in the CPU's order; otherwise parallel,
+ * deterministic reductions are used.
  */
 
 #ifndef SMINA_GPU_EVAL_CUH
@@ -16,11 +16,10 @@
 #include "gpu_defs.h"
 #include "gpu_dev_structs.h"
 #include "gpu_math.cuh"
+#include "gpu_group.cuh"
 
 namespace gpusmina
 {
-
-const unsigned FULL_MASK = 0xffffffffu;
 
 template<typename T> __host__ __device__ inline ModelView<T> make_view(
 		const DevModels<T>& dm, int m)
@@ -40,11 +39,131 @@ template<typename T> __host__ __device__ inline ModelView<T> make_view(
 	v.list_start = dm.list_start + v.d.list_offset;
 	v.blocks = dm.blocks + v.d.block_offset;
 	v.heavy = dm.heavy + v.d.heavy_offset;
+	v.nbr_start = dm.nbr_start + v.d.nbr_start_offset;
+	v.nbr = dm.nbr + v.d.nbr_offset;
+	return v;
+}
+
+// Layout of a model's static data staged in shared memory: T-aligned arrays
+// first, then 4-byte ones.  Shared by host (sizing) and device (staging).
+struct StagedLayout
+{
+	size_t charge, local, inflex, frames, pairs; // T aligned
+	size_t type, frame, children, level_frames, level_start, list_start,
+			blocks, heavy, nbr_start, nbr; // 4-byte aligned
+	size_t bytes;
+};
+
+template<typename T> __host__ __device__ inline StagedLayout staged_layout(
+		const ModelDesc& d)
+{
+	StagedLayout L;
+	size_t at = 0;
+	const int ninflex = d.num_atoms - d.num_movable;
+	L.charge = at;
+	at += sizeof(T) * d.num_movable;
+	L.local = at;
+	at += sizeof(T) * 3 * d.num_movable;
+	L.inflex = at;
+	at += sizeof(T) * 3 * ninflex;
+	L.frames = at;
+	at += sizeof(Frame<T>) * d.num_frames;
+	L.pairs = at;
+	at += sizeof(Pair<T>) * d.num_pairs;
+	L.type = at;
+	at += 4 * d.num_movable;
+	L.frame = at;
+	at += 4 * d.num_movable;
+	L.children = at;
+	at += 4 * d.num_children;
+	L.level_frames = at;
+	at += 4 * d.num_frames;
+	L.level_start = at;
+	at += 4 * (d.num_levels + 1);
+	L.list_start = at;
+	at += 4 * (d.num_lists + 1);
+	L.blocks = at;
+	at += sizeof(ConfBlock) * d.num_blocks;
+	L.heavy = at;
+	at += 4 * d.num_heavy;
+	L.nbr_start = at;
+	at += 4 * (d.num_movable + 1);
+	L.nbr = at;
+	at += 4 * d.num_nbr;
+	L.bytes = (at + 15) & ~size_t(15);
+	return L;
+}
+
+template<typename X> __device__ __forceinline__ void block_copy(X* dst,
+		const X* src, int n)
+{
+	const int* s = reinterpret_cast<const int*>(src);
+	int* d = reinterpret_cast<int*>(dst);
+	const int words = int(n * sizeof(X) / 4);
+	for (int i = threadIdx.x; i < words; i += blockDim.x)
+		d[i] = s[i];
+}
+
+// copy a model's static data into shared memory at `smem` and return a view
+// of it; must be called by every thread of the block, followed by
+// __syncthreads()
+template<typename T> __device__ ModelView<T> stage_model(
+		const ModelView<T>& g, unsigned char* smem)
+{
+	const StagedLayout L = staged_layout<T>(g.d);
+	ModelView<T> v;
+	v.d = g.d;
+	T* charge = reinterpret_cast<T*>(smem + L.charge);
+	T* local = reinterpret_cast<T*>(smem + L.local);
+	T* inflex = reinterpret_cast<T*>(smem + L.inflex);
+	Frame<T>* frames = reinterpret_cast<Frame<T>*>(smem + L.frames);
+	Pair<T>* pairs = reinterpret_cast<Pair<T>*>(smem + L.pairs);
+	int* type = reinterpret_cast<int*>(smem + L.type);
+	int* frame = reinterpret_cast<int*>(smem + L.frame);
+	int* children = reinterpret_cast<int*>(smem + L.children);
+	int* level_frames = reinterpret_cast<int*>(smem + L.level_frames);
+	int* level_start = reinterpret_cast<int*>(smem + L.level_start);
+	int* list_start = reinterpret_cast<int*>(smem + L.list_start);
+	ConfBlock* blocks = reinterpret_cast<ConfBlock*>(smem + L.blocks);
+	int* heavy = reinterpret_cast<int*>(smem + L.heavy);
+	int* nbr_start = reinterpret_cast<int*>(smem + L.nbr_start);
+	int* nbr = reinterpret_cast<int*>(smem + L.nbr);
+	const ModelDesc& d = g.d;
+	block_copy(charge, g.atom_charge, d.num_movable);
+	block_copy(local, g.atom_local, 3 * d.num_movable);
+	block_copy(inflex, g.inflex_coords, 3 * (d.num_atoms - d.num_movable));
+	block_copy(frames, g.frames, d.num_frames);
+	block_copy(pairs, g.pairs, d.num_pairs);
+	block_copy(type, g.atom_type, d.num_movable);
+	block_copy(frame, g.atom_frame, d.num_movable);
+	block_copy(children, g.children, d.num_children);
+	block_copy(level_frames, g.level_frames, d.num_frames);
+	block_copy(level_start, g.level_start, d.num_levels + 1);
+	block_copy(list_start, g.list_start, d.num_lists + 1);
+	block_copy(blocks, g.blocks, d.num_blocks);
+	block_copy(heavy, g.heavy, d.num_heavy);
+	block_copy(nbr_start, g.nbr_start, d.num_movable + 1);
+	block_copy(nbr, g.nbr, d.num_nbr);
+	v.atom_charge = charge;
+	v.atom_local = local;
+	v.inflex_coords = inflex;
+	v.frames = frames;
+	v.pairs = pairs;
+	v.atom_type = type;
+	v.atom_frame = frame;
+	v.children = children;
+	v.level_frames = level_frames;
+	v.level_start = level_start;
+	v.list_start = list_start;
+	v.blocks = blocks;
+	v.heavy = heavy;
+	v.nbr_start = nbr_start;
+	v.nbr = nbr;
 	return v;
 }
 
 template<typename T> __device__ __forceinline__ EvalScratch<T> make_scratch(
-		T* base, const ScratchOffsets& so, int* error)
+		T* base, T* pair_buf, const ScratchOffsets& so, int* error)
 {
 	EvalScratch<T> ws;
 	ws.coords = base + so.coords;
@@ -54,16 +173,9 @@ template<typename T> __device__ __forceinline__ EvalScratch<T> make_scratch(
 	ws.frame_m = base + so.frame_m;
 	ws.frame_axis = base + so.frame_axis;
 	ws.frame_ft = base + so.frame_ft;
-	ws.pair_buf = base + so.pair_buf;
+	ws.pair_buf = pair_buf;
 	ws.error = error;
 	return ws;
-}
-
-template<typename T> __device__ __forceinline__ T warp_sum(T v)
-{
-	for (int o = 16; o > 0; o >>= 1)
-		v += __shfl_xor_sync(FULL_MASK, v, o);
-	return v;
 }
 
 template<typename T> __device__ __forceinline__ vec3<T> atom_coords(
@@ -85,13 +197,17 @@ template<typename T> __device__ __forceinline__ T comb4(const T c[4], T w1,
 
 // precalculate::eval_deriv for a pair of atoms a (first) and b (second)
 // whose types index table `tpair`; swapped means type(a) > type(b).
-// Returns e and dor (derivative over r).
-template<typename T> __device__ void table_eval_deriv(const DevTables<T>& tb,
+// Returns e and dor (derivative over r).  KIND (0 linear, 1 spline) and NC
+// (1 or 4 components) are compile-time for the hot loops; KIND -1 dispatches
+// at run time.
+template<typename T, int KIND = -1, int NC = -1>
+__device__ __forceinline__ void table_eval_deriv(const DevTables<T>& tb,
 		int tpair, bool swapped, T abs_qa, T abs_qb, T qab, T r2, T& e,
 		T& dor)
 {
-	const int nc = tb.nc;
-	if (tb.kind == 0)
+	const int nc = (NC > 0) ? NC : tb.nc;
+	const int kind = (KIND >= 0) ? KIND : tb.kind;
+	if (kind == 0)
 	{
 		// precalculate_linear: data(min,max).eval_deriv(nc, A, B) with
 		// (A, B) = swapped ? (b, a) : (a, b)
@@ -173,8 +289,8 @@ template<typename T> __device__ void table_eval_deriv(const DevTables<T>& tb,
 
 // precalculate::eval_fast(t1, t2, r2) -> result components oriented (t1, t2)
 // used by the grid builder (cache::populate)
-template<typename T> __device__ void table_eval_fast(const DevTables<T>& tb,
-		int t1, int t2, T r2, T out[4])
+template<typename T> __device__ __forceinline__ void table_eval_fast(
+		const DevTables<T>& tb, int t1, int t2, T r2, T out[4])
 {
 	const int nc = tb.nc;
 	int tpair = tri_index_permissive(t1, t2);
@@ -213,7 +329,8 @@ template<typename T> __device__ void table_eval_fast(const DevTables<T>& tb,
 ////////////////////////////// grids //////////////////////////////
 
 // grid::evaluate_aux
-template<typename T> __device__ T grid_evaluate_aux(const DevGridGeometry<T>& g,
+template<typename T> __device__ __forceinline__ T grid_evaluate_aux(
+		const DevGridGeometry<T>& g,
 		const T* data, const vec3<T>& location, T slope, T v, vec3<T>* deriv)
 {
 	vec3<T> s;
@@ -298,13 +415,13 @@ template<typename T> __device__ T grid_evaluate_aux(const DevGridGeometry<T>& g,
 ////////////////////////////// conformation //////////////////////////////
 
 // model::set: ligands.set_conf then flex.set_conf, frames level by level
-template<typename T> __device__ void set_conf(const ModelView<T>& mv,
-		const T* conf, EvalScratch<T>& ws, int lane)
+template<typename T, int TPC> __device__ void set_conf(const ModelView<T>& mv,
+		const T* conf, EvalScratch<T>& ws, const Group<TPC>& G)
 {
 	for (int lv = 0; lv < mv.d.num_levels; lv++)
 	{
-		for (int k = mv.level_start[lv] + lane; k < mv.level_start[lv + 1];
-				k += 32)
+		for (int k = mv.level_start[lv] + G.rank; k < mv.level_start[lv + 1];
+				k += TPC)
 		{
 			const int fi = mv.level_frames[k];
 			const Frame<T>& f = mv.frames[fi];
@@ -348,10 +465,10 @@ template<typename T> __device__ void set_conf(const ModelView<T>& mv,
 			for (int j = 0; j < 9; j++)
 				ws.frame_m[9 * fi + j] = m.d[j];
 		}
-		__syncwarp();
+		G.sync();
 	}
 	// atom_frame::set_coords: origin + orientation_m * local
-	for (int i = lane; i < mv.d.num_movable; i += 32)
+	for (int i = G.rank; i < mv.d.num_movable; i += TPC)
 	{
 		const int fi = mv.atom_frame[i];
 		mat3<T> m;
@@ -361,19 +478,35 @@ template<typename T> __device__ void set_conf(const ModelView<T>& mv,
 				+ mul(m, load3(mv.atom_local + 3 * i));
 		store3(ws.coords + 3 * i, c);
 	}
-	__syncwarp();
+	G.sync();
 }
 
 ////////////////////////////// interactions //////////////////////////////
 
+// sum of per-atom values: CPU order (rank 0) when ORDERED, else parallel
+template<typename T, bool ORDERED, int TPC> __device__ T sum_atoms(
+		const T* atom_e, int n, T part, const Group<TPC>& G)
+{
+	if (ORDERED)
+	{
+		G.sync();
+		T e = 0;
+		if (G.rank == 0)
+			for (int i = 0; i < n; i++)
+				e += atom_e[i];
+		return G.bcast(e);
+	}
+	return G.sum(part);
+}
+
 // cache::eval_deriv: sets forces of all movable atoms, returns energy
-template<typename T, bool ORDERED> __device__ T cache_eval_deriv(
+template<typename T, bool ORDERED, int TPC> __device__ T cache_eval_deriv(
 		const ModelView<T>& mv, const DevGrids<T>& grids, T slope, T v,
-		EvalScratch<T>& ws, int lane)
+		EvalScratch<T>& ws, const Group<TPC>& G)
 {
 	T* atom_e = ws.pair_buf; // ORDERED only
 	T part = 0;
-	for (int i = lane; i < mv.d.num_movable; i += 32)
+	for (int i = G.rank; i < mv.d.num_movable; i += TPC)
 	{
 		const int t = mv.atom_type[i];
 		T ei = 0;
@@ -398,16 +531,7 @@ template<typename T, bool ORDERED> __device__ T cache_eval_deriv(
 		else
 			part += ei;
 	}
-	__syncwarp();
-	if (ORDERED)
-	{
-		T e = 0;
-		if (lane == 0)
-			for (int i = 0; i < mv.d.num_movable; i++)
-				e += atom_e[i];
-		return __shfl_sync(FULL_MASK, e, 0);
-	}
-	return warp_sum(part);
+	return sum_atoms<T, ORDERED>(atom_e, mv.d.num_movable, part, G);
 }
 
 // grid::evaluate_user on the --user_grid (no deriv when deriv == null)
@@ -417,16 +541,16 @@ template<typename T> __device__ T user_grid_eval(const DevUserGrid<T>& ug,
 	return grid_evaluate_aux(ug.geo, ug.data, loc, slope, T(1000), deriv);
 }
 
-// non_cache::eval_deriv: one lane per ligand atom, receptor atoms in the
+// non_cache::eval_deriv: one thread per ligand atom, receptor atoms in the
 // CPU's possibilities order
-template<typename T, bool ORDERED> __device__ T non_cache_eval_deriv(
+template<typename T, bool ORDERED, int TPC> __device__ T non_cache_eval_deriv(
 		const ModelView<T>& mv, const DevReceptor<T>& rec,
 		const DevTables<T>& tb, const DevUserGrid<T>& ug, T slope, T v,
-		EvalScratch<T>& ws, int lane)
+		EvalScratch<T>& ws, const Group<TPC>& G)
 {
 	T* atom_e = ws.pair_buf;
 	T part = 0;
-	for (int i = lane; i < mv.d.num_movable; i += 32)
+	for (int i = G.rank; i < mv.d.num_movable; i += TPC)
 	{
 		const int t1 = mv.atom_type[i];
 		T contrib = 0;
@@ -501,35 +625,25 @@ template<typename T, bool ORDERED> __device__ T non_cache_eval_deriv(
 		else
 			part += contrib;
 	}
-	__syncwarp();
-	if (ORDERED)
-	{
-		T e = 0;
-		if (lane == 0)
-			for (int i = 0; i < mv.d.num_movable; i++)
-				e += atom_e[i];
-		return __shfl_sync(FULL_MASK, e, 0);
-	}
-	return warp_sum(part);
+	return sum_atoms<T, ORDERED>(atom_e, mv.d.num_movable, part, G);
 }
 
-// model::eval_interacting_pairs_deriv over list l; adds to forces
-template<typename T, bool ORDERED> __device__ T pairs_eval_deriv(
+// model::eval_interacting_pairs_deriv over list l in CPU order (ORDERED):
+// pair terms in parallel, accumulation by rank 0; adds to forces
+template<typename T, int TPC> __device__ T pairs_ordered(
 		const ModelView<T>& mv, const DevTables<T>& tb, int l, T v,
-		EvalScratch<T>& ws, int lane)
+		EvalScratch<T>& ws, const Group<TPC>& G)
 {
 	const int begin = mv.list_start[l], end = mv.list_start[l + 1];
 	const int nmov = mv.d.num_movable;
-	T part = 0;
-	for (int k = begin + lane; k < end; k += 32)
+	for (int k = begin + G.rank; k < end; k += TPC)
 	{
 		const Pair<T>& p = mv.pairs[k];
 		const vec3<T> r = atom_coords(mv, ws, p.b) - atom_coords(mv, ws, p.a);
 		const T r2 = norm_sqr(r);
 		T e = 0;
 		vec3<T> force = mk(T(0), T(0), T(0));
-		bool within = r2 < tb.cutoff_sqr;
-		if (within)
+		if (r2 < tb.cutoff_sqr)
 		{
 			T dor;
 			table_eval_deriv(tb, p.tpair, p.swapped != 0, p.abs_qa, p.abs_qb,
@@ -537,74 +651,111 @@ template<typename T, bool ORDERED> __device__ T pairs_eval_deriv(
 			force = dor * r;
 			curl(e, force, v);
 		}
-		if (ORDERED)
-		{
-			T* o = ws.pair_buf + 4 * (k - begin);
-			o[0] = within ? e : T(0);
-			o[1] = force[0];
-			o[2] = force[1];
-			o[3] = force[2];
-		}
-		else if (within)
-		{
-			part += e;
-			if (p.a < nmov)
-			{
-				atomicAdd(ws.forces + 3 * p.a, -force[0]);
-				atomicAdd(ws.forces + 3 * p.a + 1, -force[1]);
-				atomicAdd(ws.forces + 3 * p.a + 2, -force[2]);
-			}
-			if (p.b < nmov)
-			{
-				atomicAdd(ws.forces + 3 * p.b, force[0]);
-				atomicAdd(ws.forces + 3 * p.b + 1, force[1]);
-				atomicAdd(ws.forces + 3 * p.b + 2, force[2]);
-			}
-		}
+		T* o = ws.pair_buf + 4 * (k - begin);
+		o[0] = e;
+		o[1] = force[0];
+		o[2] = force[1];
+		o[3] = force[2];
 	}
-	__syncwarp();
-	if (ORDERED)
+	G.sync();
+	T e = 0;
+	if (G.rank == 0)
 	{
-		T e = 0;
-		if (lane == 0)
+		for (int k = begin; k < end; k++)
 		{
-			for (int k = begin; k < end; k++)
+			const Pair<T>& p = mv.pairs[k];
+			const T* o = ws.pair_buf + 4 * (k - begin);
+			const vec3<T> r = atom_coords(mv, ws, p.b) - atom_coords(mv, ws, p.a);
+			if (norm_sqr(r) < tb.cutoff_sqr)
 			{
-				const Pair<T>& p = mv.pairs[k];
-				const T* o = ws.pair_buf + 4 * (k - begin);
-				const vec3<T> r = atom_coords(mv, ws, p.b)
-						- atom_coords(mv, ws, p.a);
-				if (norm_sqr(r) < tb.cutoff_sqr)
+				e += o[0];
+				const vec3<T> force = load3(o + 1);
+				if (p.a < nmov)
 				{
-					e += o[0];
-					const vec3<T> force = load3(o + 1);
-					if (p.a < nmov)
-					{
-						vec3<T> fa = load3(ws.forces + 3 * p.a);
-						sub_from(fa, force);
-						store3(ws.forces + 3 * p.a, fa);
-					}
-					if (p.b < nmov)
-					{
-						vec3<T> fb = load3(ws.forces + 3 * p.b);
-						add_to(fb, force);
-						store3(ws.forces + 3 * p.b, fb);
-					}
+					vec3<T> fa = load3(ws.forces + 3 * p.a);
+					sub_from(fa, force);
+					store3(ws.forces + 3 * p.a, fa);
+				}
+				if (p.b < nmov)
+				{
+					vec3<T> fb = load3(ws.forces + 3 * p.b);
+					add_to(fb, force);
+					store3(ws.forces + 3 * p.b, fb);
 				}
 			}
 		}
-		__syncwarp();
-		return __shfl_sync(FULL_MASK, e, 0);
 	}
-	return warp_sum(part);
+	return G.bcast(e);
+}
+
+// all interacting pairs in two passes, without atomics:
+//  1. pair-major: each pair evaluated once, its force stored in pair_buf
+//  2. atom-centric: each movable atom gathers +/- the forces of its pairs
+// v_list0 applies to list 0 (other_pairs), v_lig to the ligands' pairs
+template<typename T, int KIND, int NC, int TPC> __device__ T pairs_two_pass(
+		const ModelView<T>& mv, const DevTables<T>& tb, T v_list0, T v_lig,
+		EvalScratch<T>& ws, const Group<TPC>& G)
+{
+	const int npairs = mv.d.num_pairs;
+	const int list0_end = mv.list_start[1];
+	T* pf = ws.pair_buf;
+	T part = 0;
+#pragma unroll 2
+	for (int k = G.rank; k < npairs; k += TPC)
+	{
+		const Pair<T>& p = mv.pairs[k];
+		const vec3<T> r = atom_coords(mv, ws, p.b) - atom_coords(mv, ws, p.a);
+		const T r2 = norm_sqr(r);
+		vec3<T> force = mk(T(0), T(0), T(0));
+		if (r2 < tb.cutoff_sqr)
+		{
+			T e, dor;
+			table_eval_deriv<T, KIND, NC>(tb, p.tpair, p.swapped != 0, p.abs_qa,
+					p.abs_qb, p.qab, r2, e, dor);
+			force = dor * r;
+			curl(e, force, (k < list0_end) ? v_list0 : v_lig);
+			part += e;
+		}
+		store3(pf + 3 * k, force);
+	}
+	G.sync();
+	for (int i = G.rank; i < mv.d.num_movable; i += TPC)
+	{
+		vec3<T> f = load3(ws.forces + 3 * i);
+		const int e_end = mv.nbr_start[i + 1];
+		for (int en = mv.nbr_start[i]; en < e_end; en++)
+		{
+			const int code = mv.nbr[en];
+			const vec3<T> pk = load3(pf + 3 * (code >> 3));
+			if (code & 1)
+				add_to(f, pk);
+			else
+				sub_from(f, pk);
+		}
+		store3(ws.forces + 3 * i, f);
+	}
+	return G.sum(part);
+}
+
+template<typename T, int TPC> __device__ T pairs_eval_deriv_unordered(
+		const ModelView<T>& mv, const DevTables<T>& tb, T v_list0, T v_lig,
+		EvalScratch<T>& ws, const Group<TPC>& G)
+{
+	if (tb.kind == 0)
+		return (tb.nc == 1) ?
+				pairs_two_pass<T, 0, 1>(mv, tb, v_list0, v_lig, ws, G) :
+				pairs_two_pass<T, 0, 4>(mv, tb, v_list0, v_lig, ws, G);
+	return (tb.nc == 1) ?
+			pairs_two_pass<T, 1, 1>(mv, tb, v_list0, v_lig, ws, G) :
+			pairs_two_pass<T, 1, 4>(mv, tb, v_list0, v_lig, ws, G);
 }
 
 // heterotree / tree ::derivative: forces -> change vector g
-template<typename T> __device__ void derivative(const ModelView<T>& mv,
-		EvalScratch<T>& ws, T* g, int lane)
+template<typename T, int TPC> __device__ void derivative(
+		const ModelView<T>& mv, EvalScratch<T>& ws, T* g, const Group<TPC>& G)
 {
 	// atom_frame::sum_force_and_torque for every frame
-	for (int fi = lane; fi < mv.d.num_frames; fi += 32)
+	for (int fi = G.rank; fi < mv.d.num_frames; fi += TPC)
 	{
 		const Frame<T>& f = mv.frames[fi];
 		const vec3<T> origin = load3(ws.frame_origin + 3 * fi);
@@ -618,12 +769,12 @@ template<typename T> __device__ void derivative(const ModelView<T>& mv,
 		store3(ws.frame_ft + 6 * fi, force);
 		store3(ws.frame_ft + 6 * fi + 3, torque);
 	}
-	__syncwarp();
+	G.sync();
 	// branches_derivative bottom-up, then set_derivative
 	for (int lv = mv.d.num_levels - 1; lv >= 0; lv--)
 	{
-		for (int k = mv.level_start[lv] + lane; k < mv.level_start[lv + 1];
-				k += 32)
+		for (int k = mv.level_start[lv] + G.rank; k < mv.level_start[lv + 1];
+				k += TPC)
 		{
 			const int fi = mv.level_frames[k];
 			const Frame<T>& f = mv.frames[fi];
@@ -649,29 +800,67 @@ template<typename T> __device__ void derivative(const ModelView<T>& mv,
 			else
 				g[f.change_idx] = dot(torque, load3(ws.frame_axis + 3 * fi));
 		}
-		__syncwarp();
+		G.sync();
 	}
 }
 
+// optional section timers (build with -DGPU_PROFILE): cycles accumulated by
+// lane 0 of the first warp, reported by the kernels' host wrappers
+#ifdef GPU_PROFILE
+enum ProfileSection
+{
+	PROF_SET_CONF, PROF_INTER, PROF_PAIRS, PROF_DERIV, PROF_EVAL_TOTAL,
+	PROF_BFGS_TOTAL, PROF_MUTATE, PROF_OUTPUT, PROF_MC_TOTAL, PROF_EVALS,
+	PROF_COUNT
+};
+__device__ unsigned long long g_prof[PROF_COUNT];
+#define PROF_START(v) long long v = clock64()
+#define PROF_ADD(sec, v) \
+	if (blockIdx.x == 0 && threadIdx.x == 0) \
+		g_prof[sec] += clock64() - (v)
+#define PROF_COUNT_ADD(sec, n) \
+	if (blockIdx.x == 0 && threadIdx.x == 0) \
+		g_prof[sec] += (n)
+#else
+#define PROF_START(v)
+#define PROF_ADD(sec, v)
+#define PROF_COUNT_ADD(sec, n)
+#endif
+
 // model::eval_deriv; v = {intra-ligand, intermolecular, other pairs}
-template<typename T, bool ORDERED> __device__ T eval_deriv(
+template<typename T, bool ORDERED, int TPC> __device__ T eval_deriv(
 		const ModelView<T>& mv, const DevTables<T>& tb,
 		const InterContext<T>& ic, const T v[3], const T* conf, T* g,
-		EvalScratch<T>& ws, int lane)
+		EvalScratch<T>& ws, const Group<TPC>& G)
 {
-	set_conf(mv, conf, ws, lane);
+	PROF_START(t0);
+	set_conf(mv, conf, ws, G);
+	PROF_ADD(PROF_SET_CONF, t0);
+	PROF_START(t1);
 	T e;
 	if (ic.use_cache)
-		e = cache_eval_deriv<T, ORDERED>(mv, ic.grids, ic.slope, v[1], ws, lane);
+		e = cache_eval_deriv<T, ORDERED>(mv, ic.grids, ic.slope, v[1], ws, G);
 	else
 		e = non_cache_eval_deriv<T, ORDERED>(mv, ic.rec, tb, ic.ug, ic.slope,
-				v[1], ws, lane);
-	__syncwarp();
-	e += pairs_eval_deriv<T, ORDERED>(mv, tb, 0, v[2], ws, lane);
-	for (int l = 1; l < mv.d.num_lists; l++)
-		e += pairs_eval_deriv<T, ORDERED>(mv, tb, l, v[0], ws, lane);
-	__syncwarp();
-	derivative(mv, ws, g, lane);
+				v[1], ws, G);
+	G.sync();
+	PROF_ADD(PROF_INTER, t1);
+	PROF_START(t2);
+	if (ORDERED)
+	{
+		e += pairs_ordered(mv, tb, 0, v[2], ws, G);
+		for (int l = 1; l < mv.d.num_lists; l++)
+			e += pairs_ordered(mv, tb, l, v[0], ws, G);
+	}
+	else
+		e += pairs_eval_deriv_unordered(mv, tb, v[2], v[0], ws, G);
+	G.sync();
+	PROF_ADD(PROF_PAIRS, t2);
+	PROF_START(t3);
+	derivative(mv, ws, g, G);
+	PROF_ADD(PROF_DERIV, t3);
+	PROF_ADD(PROF_EVAL_TOTAL, t0);
+	PROF_COUNT_ADD(PROF_EVALS, 1);
 	return e;
 }
 

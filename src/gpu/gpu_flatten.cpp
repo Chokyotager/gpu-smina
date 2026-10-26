@@ -213,6 +213,26 @@ FlatModel gpu_model_flattener::flatten_model(const model& m)
 		}
 		fm.list_start.push_back(int(fm.pairs.size()));
 	}
+
+	// atom-centric view of the pairs (float kernels avoid atomics with it)
+	std::vector<std::vector<int> > per_atom(nmov);
+	VINA_FOR_IN(k, fm.pairs)
+	{
+		const Pair<double>& p = fm.pairs[k];
+		const int list0 = int(k) < fm.list_start[1];
+		const bool a_mov = p.a < int(nmov), b_mov = p.b < int(nmov);
+		if (a_mov)
+			per_atom[p.a].push_back((int(k) << 3) | (list0 << 1) | (1 << 2));
+		if (b_mov)
+			per_atom[p.b].push_back((int(k) << 3) | 1 | (list0 << 1)
+					| ((a_mov ? 0 : 1) << 2));
+	}
+	fm.nbr_start.push_back(0);
+	VINA_FOR(i, nmov)
+	{
+		fm.nbr.insert(fm.nbr.end(), per_atom[i].begin(), per_atom[i].end());
+		fm.nbr_start.push_back(int(fm.nbr.size()));
+	}
 	return fm;
 }
 

@@ -309,12 +309,13 @@ void DeviceModels<T>::upload(const std::vector<const FlatModel*>& models)
 {
 	host_desc.clear();
 	std::vector<int> v_type, v_frame, v_children, v_level_frames,
-			v_level_start, v_list_start, v_heavy;
+			v_level_start, v_list_start, v_heavy, v_nbr_start, v_nbr;
 	std::vector<double> v_charge, v_local, v_init, v_inflex, v_forigin;
 	std::vector<Frame<T> > v_frames;
 	std::vector<Pair<T> > v_pairs;
 	std::vector<ConfBlock> v_blocks;
-	max_movable = max_frames = max_list = max_change = max_conf = max_heavy = 0;
+	max_movable = max_frames = max_list = max_change = max_conf = max_heavy =
+			max_pairs = 0;
 
 	for (size_t mi = 0; mi < models.size(); mi++)
 	{
@@ -340,7 +341,15 @@ void DeviceModels<T>::upload(const std::vector<const FlatModel*>& models)
 		d.num_heavy = int(m.heavy.size());
 		d.num_ligands = m.num_ligands;
 		d.num_flex = m.num_flex;
+		d.nbr_start_offset = int(v_nbr_start.size());
+		d.nbr_offset = int(v_nbr.size());
+		d.num_pairs = int(m.pairs.size());
+		d.num_nbr = int(m.nbr.size());
+		d.num_children = int(m.children.size());
 		host_desc.push_back(d);
+		v_nbr_start.insert(v_nbr_start.end(), m.nbr_start.begin(),
+				m.nbr_start.end());
+		v_nbr.insert(v_nbr.end(), m.nbr.begin(), m.nbr.end());
 
 		v_type.insert(v_type.end(), m.atom_type.begin(), m.atom_type.end());
 		v_charge.insert(v_charge.end(), m.atom_charge.begin(), m.atom_charge.end());
@@ -371,6 +380,7 @@ void DeviceModels<T>::upload(const std::vector<const FlatModel*>& models)
 		max_change = std::max(max_change, m.change_size);
 		max_conf = std::max(max_conf, m.conf_size);
 		max_heavy = std::max(max_heavy, int(m.heavy.size()));
+		max_pairs = std::max(max_pairs, int(m.pairs.size()));
 	}
 
 	desc.upload(&host_desc[0], host_desc.size() * sizeof(ModelDesc));
@@ -389,6 +399,8 @@ void DeviceModels<T>::upload(const std::vector<const FlatModel*>& models)
 	upload_converted<int>(list_start, v_list_start);
 	upload_converted<ConfBlock>(blocks, v_blocks);
 	upload_converted<int>(heavy, v_heavy);
+	upload_converted<int>(nbr_start, v_nbr_start);
+	upload_converted<int>(nbr, v_nbr);
 
 	dev.num_models = int(host_desc.size());
 	dev.desc = desc.get<ModelDesc>();
@@ -407,10 +419,12 @@ void DeviceModels<T>::upload(const std::vector<const FlatModel*>& models)
 	dev.list_start = list_start.get<int>();
 	dev.blocks = blocks.get<ConfBlock>();
 	dev.heavy = heavy.get<int>();
+	dev.nbr_start = nbr_start.get<int>();
+	dev.nbr = nbr.get<int>();
 }
 
 ScratchOffsets scratch_layout(int max_movable, int max_frames, int max_list,
-		bool ordered)
+		int max_pairs, bool ordered)
 {
 	ScratchOffsets s;
 	s.coords = 0;
@@ -420,9 +434,10 @@ ScratchOffsets scratch_layout(int max_movable, int max_frames, int max_list,
 	s.frame_m = s.frame_q + 4 * max_frames;
 	s.frame_axis = s.frame_m + 9 * max_frames;
 	s.frame_ft = s.frame_axis + 3 * max_frames;
-	s.pair_buf = s.frame_ft + 6 * max_frames;
-	int pb = ordered ? std::max(max_movable, 4 * max_list) : 0;
-	s.total = s.pair_buf + pb;
+	s.total = s.frame_ft + 6 * max_frames;
+	// ORDERED: per-atom energies or (e, f) of one pair list;
+	// otherwise the forces of all pairs (two-pass evaluation)
+	s.pair_total = ordered ? std::max(max_movable, 4 * max_list) : 3 * max_pairs;
 	return s;
 }
 
