@@ -20,7 +20,6 @@
 #include "cache.h"
 #include "non_cache.h"
 #include "naive_non_cache.h"
-#include "non_cache_gpu.h"
 #include "parse_error.h"
 #include "everything.h"
 #include "weighted_terms.h"
@@ -40,8 +39,9 @@
 #include <boost/shared_ptr.hpp>
 #include "coords.h"
 #include "obmolopener.h"
-#include "gpucode.h"
-#include "precalculate_gpu.h"
+#ifdef SMINA_GPU
+#include "gpu_docking.h"
+#endif
 #include <boost/timer/timer.hpp>
 #include <boost/algorithm/string.hpp>
 #include <boost/unordered_set.hpp>
@@ -55,6 +55,11 @@
 
 using namespace boost::iostreams;
 using boost::filesystem::path;
+
+namespace gpusmina
+{
+class GpuDocking;
+}
 
 
 //just a collection of user-specified configurations
@@ -203,6 +208,78 @@ output_container remove_redundant(const output_container& in, fl min_rmsd)
 	return tmp;
 }
 
+//the end of the docking search: rescore the refined poses with the
+//full scoring function, remove redundant poses, log and collect results
+void finish_docking(model& m, const boost::optional<model>& ref,
+		const weighted_terms& sf, const precalculate& prec, non_cache& nc,
+		const user_settings& settings, bool compute_atominfo, tee& log,
+		grid& user_grid, std::vector<result_info>& results,
+		output_container& out_cont, const vec& authentic_v)
+{
+	if (!out_cont.empty())
+	{
+		out_cont.sort();
+		const fl best_mode_intramolecular_energy = m.eval_intramolecular(
+				prec, authentic_v, out_cont[0].c);
+
+		VINA_FOR_IN(i, out_cont)
+			if (not_max(out_cont[i].e))
+				out_cont[i].e = m.eval_adjusted(sf, prec, nc, authentic_v,
+						out_cont[i].c, best_mode_intramolecular_energy,
+						user_grid);
+		// the order must not change because of non-decreasing g (see paper), but we'll re-sort in case g is non strictly increasing
+		out_cont.sort();
+	}
+	out_cont = remove_redundant(out_cont, settings.out_min_rmsd);
+
+	done(settings.verbosity, log);
+
+	log.setf(std::ios::fixed, std::ios::floatfield);
+	log.setf(std::ios::showpoint);
+	log << '\n';
+	log << "mode |   affinity | dist from best mode\n";
+	log << "     | (kcal/mol) | rmsd l.b.| rmsd u.b.\n";
+	log << "-----+------------+----------+----------\n";
+
+	model best_mode_model = m;
+	if (!out_cont.empty())
+		best_mode_model.set(out_cont.front().c);
+
+	sz how_many = 0;
+	VINA_FOR_IN(i, out_cont)
+	{
+		if (how_many >= settings.num_modes || !not_max(out_cont[i].e)
+				|| out_cont[i].e > out_cont[0].e + settings.energy_range)
+			break; // check energy_range sanity FIXME
+		++how_many;
+		log << std::setw(4) << i + 1 << "    " << std::setw(9)
+				<< std::setprecision(1) << out_cont[i].e; // intermolecular_energies[i];
+		m.set(out_cont[i].c);
+		const model& r = ref ? ref.get() : best_mode_model;
+		const fl lb = m.rmsd_lower_bound(r);
+		const fl ub = m.rmsd_upper_bound(r);
+		log << "  " << std::setw(9) << std::setprecision(3) << lb << "  "
+				<< std::setw(9) << std::setprecision(3) << ub; // FIXME need user-readable error messages in case of failures
+
+		log.endl();
+
+		//dkoes - setup result_info
+		results.push_back(result_info(out_cont[i].e, -1, m));
+		if (compute_atominfo)
+			results.back().setAtomValues(m, &sf);
+
+	}
+	done(settings.verbosity, log);
+
+	if (how_many < 1)
+	{
+		log
+				<< "WARNING: Could not find any conformations completely within the search space.\n"
+				<< "WARNING: Check that it is large enough for all movable atoms, including those in the flexible side chains.";
+		log.endl();
+	}
+}
+
 //dkoes - return all energies and rmsds to original conf with result
 void do_search(model& m, const boost::optional<model>& ref,
 		const weighted_terms& sf, const precalculate& prec, const igrid& ig,
@@ -210,7 +287,8 @@ void do_search(model& m, const boost::optional<model>& ref,
 		const vec& corner1, const vec& corner2,
 		const parallel_mc& par, const user_settings& settings,
 		bool compute_atominfo, tee& log,
-		const terms *t, grid& user_grid, std::vector<result_info>& results)
+		const terms *t, grid& user_grid, std::vector<result_info>& results,
+		gpusmina::GpuDocking* gpu, const grid_dims& gd, fl cache_slope)
 {
 	boost::timer::cpu_timer time;
 
@@ -265,6 +343,16 @@ void do_search(model& m, const boost::optional<model>& ref,
 		vecv origcoords = m.get_heavy_atom_movable_coords();
 		output_type out(c, e);
 		doing(settings.verbosity, "Performing local search", log);
+#ifdef SMINA_GPU
+		if (gpu)
+		{
+			std::vector<output_type*> poses(1, &out);
+			gpu->refine(m, prec, gd, poses, authentic_v, par.mc.ssd_par.minparm,
+					user_grid);
+			m.set(out.c);
+		}
+		else
+#endif
 		refine_structure(m, prec, nc, out, authentic_v, par.mc.ssd_par.minparm,
 				user_grid);
 		done(settings.verbosity, log);
@@ -308,75 +396,32 @@ void do_search(model& m, const boost::optional<model>& ref,
 		log.endl();
 		output_container out_cont;
 		doing(settings.verbosity, "Performing search", log);
+#ifdef SMINA_GPU
+		if (gpu)
+			gpu->parallel_mc(par, m, out_cont, prec, gd, corner1, corner2,
+					generator, user_grid, cache_slope);
+		else
+#endif
 		par(m, out_cont, prec, ig, corner1, corner2, generator, user_grid);
 		done(settings.verbosity, log);
 		doing(settings.verbosity, "Refining results", log);
+#ifdef SMINA_GPU
+		if (gpu)
+		{
+			std::vector<output_type*> poses;
+			VINA_FOR_IN(i, out_cont)
+				poses.push_back(&out_cont[i]);
+			gpu->refine(m, prec, gd, poses, authentic_v, par.mc.ssd_par.minparm,
+					user_grid);
+		}
+		else
+#endif
 		VINA_FOR_IN(i, out_cont)
 			refine_structure(m, prec, nc, out_cont[i], authentic_v,
 					par.mc.ssd_par.minparm, user_grid);
 
-		if (!out_cont.empty())
-		{
-			out_cont.sort();
-			const fl best_mode_intramolecular_energy = m.eval_intramolecular(
-					prec, authentic_v, out_cont[0].c);
-
-			VINA_FOR_IN(i, out_cont)
-				if (not_max(out_cont[i].e))
-					out_cont[i].e = m.eval_adjusted(sf, prec, nc, authentic_v,
-							out_cont[i].c, best_mode_intramolecular_energy,
-							user_grid);
-			// the order must not change because of non-decreasing g (see paper), but we'll re-sort in case g is non strictly increasing
-			out_cont.sort();
-		}
-		out_cont = remove_redundant(out_cont, settings.out_min_rmsd);
-
-		done(settings.verbosity, log);
-
-		log.setf(std::ios::fixed, std::ios::floatfield);
-		log.setf(std::ios::showpoint);
-		log << '\n';
-		log << "mode |   affinity | dist from best mode\n";
-		log << "     | (kcal/mol) | rmsd l.b.| rmsd u.b.\n";
-		log << "-----+------------+----------+----------\n";
-
-		model best_mode_model = m;
-		if (!out_cont.empty())
-			best_mode_model.set(out_cont.front().c);
-
-		sz how_many = 0;
-		VINA_FOR_IN(i, out_cont)
-		{
-			if (how_many >= settings.num_modes || !not_max(out_cont[i].e)
-					|| out_cont[i].e > out_cont[0].e + settings.energy_range)
-				break; // check energy_range sanity FIXME
-			++how_many;
-			log << std::setw(4) << i + 1 << "    " << std::setw(9)
-					<< std::setprecision(1) << out_cont[i].e; // intermolecular_energies[i];
-			m.set(out_cont[i].c);
-			const model& r = ref ? ref.get() : best_mode_model;
-			const fl lb = m.rmsd_lower_bound(r);
-			const fl ub = m.rmsd_upper_bound(r);
-			log << "  " << std::setw(9) << std::setprecision(3) << lb << "  "
-					<< std::setw(9) << std::setprecision(3) << ub; // FIXME need user-readable error messages in case of failures
-
-			log.endl();
-
-			//dkoes - setup result_info
-			results.push_back(result_info(out_cont[i].e, -1, m));
-			if (compute_atominfo)
-				results.back().setAtomValues(m, &sf);
-
-		}
-		done(settings.verbosity, log);
-
-		if (how_many < 1)
-		{
-			log
-					<< "WARNING: Could not find any conformations completely within the search space.\n"
-					<< "WARNING: Check that it is large enough for all movable atoms, including those in the flexible side chains.";
-			log.endl();
-		}
+		finish_docking(m, ref, sf, prec, nc, settings, compute_atominfo, log,
+				user_grid, results, out_cont, authentic_v);
 	}
 	std::cout << "Refine time " << time.elapsed().wall / 1000000000.0 << "\n";
 }
@@ -401,22 +446,10 @@ void load_ent_values(const grid_dims& gd, std::istream& user_in,
 	std::cout << user_data(gd[0].n - 3, gd[1].n, gd[2].n) << "\n";
 }
 
-void main_procedure(model& m, precalculate& prec,
-		const boost::optional<model>& ref, // m is non-const (FIXME?)
-		const user_settings& settings,
-		bool no_cache, bool compute_atominfo, bool gpu_on,
-		const grid_dims& gd, minimization_params minparm,
-		const weighted_terms& wt, tee& log,
-		std::vector<result_info>& results, grid& user_grid)
+//the search parameters main_procedure uses for model m
+void setup_search(const model& m, const user_settings& settings,
+		minimization_params minparm, parallel_mc& par)
 {
-	doing(settings.verbosity, "Setting up the scoring function", log);
-
-	done(settings.verbosity, log);
-
-	vec corner1(gd[0].begin, gd[1].begin, gd[2].begin);
-	vec corner2(gd[0].end, gd[1].end, gd[2].end);
-
-	parallel_mc par;
 	sz heuristic = m.num_movable_atoms()
 			+ 10 * m.get_size().num_degrees_of_freedom();
 	par.mc.num_steps = unsigned(70 * 3 * (50 + heuristic) / 2); // 2 * 70 -> 8 * 20 // FIXME
@@ -430,6 +463,25 @@ void main_procedure(model& m, precalculate& prec,
 	par.num_tasks = settings.exhaustiveness;
 	par.num_threads = settings.cpu;
 	par.display_progress = true;
+}
+
+void main_procedure(model& m, precalculate& prec,
+		const boost::optional<model>& ref, // m is non-const (FIXME?)
+		const user_settings& settings,
+		bool no_cache, bool compute_atominfo, gpusmina::GpuDocking* gpu,
+		const grid_dims& gd, minimization_params minparm,
+		const weighted_terms& wt, tee& log,
+		std::vector<result_info>& results, grid& user_grid)
+{
+	doing(settings.verbosity, "Setting up the scoring function", log);
+
+	done(settings.verbosity, log);
+
+	vec corner1(gd[0].begin, gd[1].begin, gd[2].begin);
+	vec corner2(gd[0].end, gd[1].end, gd[2].end);
+
+	parallel_mc par;
+	setup_search(m, settings, minparm, par);
 
 	szv_grid_cache gridcache(m, prec.cutoff_sqr());
 	const fl slope = 1e6; // FIXME: too large? used to be 100
@@ -442,25 +494,13 @@ void main_procedure(model& m, precalculate& prec,
 	else
 	{
 
-		non_cache *nc = NULL;
-#ifdef SMINA_GPU
-		if(gpu_on)
-		{
-			precalculate_gpu *gprec = dynamic_cast<precalculate_gpu*>(&prec);
-			if(!gprec) abort();
-			nc = new non_cache_gpu(gridcache, gd, gprec, slope);
-		}
-		else
-#endif
-		{
-			nc = new non_cache(gridcache, gd, &prec, slope);
-		}
+		non_cache *nc = new non_cache(gridcache, gd, &prec, slope);
 		if (no_cache)
 		{
 			do_search(m, ref, wt, prec, *nc, *nc, corner1, corner2, par,
 					settings, compute_atominfo, log,
 					wt.unweighted_terms(), user_grid,
-					results);
+					results, gpu, gd, slope);
 		}
 		else
 		{
@@ -468,7 +508,7 @@ void main_procedure(model& m, precalculate& prec,
 			if (cache_needed)
 				doing(settings.verbosity, "Analyzing the binding site", log);
 			cache c("scoring_function_version001", gd, slope);
-			if (cache_needed)
+			if (cache_needed && !gpu) // the GPU builds its own grids
 			{
 				std::vector<smt> atom_types_needed;
 				m.get_movable_atom_types(atom_types_needed);
@@ -478,7 +518,7 @@ void main_procedure(model& m, precalculate& prec,
 				done(settings.verbosity, log);
 			do_search(m, ref, wt, prec, c, *nc, corner1, corner2, par,
 					settings, compute_atominfo, log,
-					wt.unweighted_terms(), user_grid, results);
+					wt.unweighted_terms(), user_grid, results, gpu, gd, slope);
 		}
 		delete nc;
 	}
@@ -710,7 +750,7 @@ void setup_user_gd(grid_dims& gd, std::ifstream& user_in)
 //enum options and their parsers
 enum ApproxType
 {
-	LinearApprox, SplineApprox, Exact, GPU
+	LinearApprox, SplineApprox, Exact
 };
 
 std::istream& operator>>(std::istream& in, ApproxType& type)
@@ -725,46 +765,11 @@ std::istream& operator>>(std::istream& in, ApproxType& type)
 		type = LinearApprox;
 	else if (token == "exact")
 		type = Exact;
-#ifdef SMINA_GPU
-	else if (token == "gpu")
-	type = GPU;
-#endif
 	else
 		throw validation_error(validation_error::invalid_option_value);
 	return in;
 }
 
-#ifdef SMINA_GPU
-
-//set the default device to device and exit with error if there are any problems
-static void initializeCUDA(int device)
-{
-	cudaSetDevice(device);
-	cudaError_t error;
-	cudaDeviceProp deviceProp;
-	error = cudaGetDevice(&device);
-
-	if (error != cudaSuccess)
-	{
-		std::cerr << "cudaGetDevice returned error code " << error << "\n";
-		exit(-1);
-	}
-
-	error = cudaGetDeviceProperties(&deviceProp, device);
-
-	if (deviceProp.computeMode == cudaComputeModeProhibited)
-	{
-		std::cerr << "Error: device is running in <Compute Mode Prohibited>, no threads can use ::cudaSetDevice().\n";
-		exit(-1);
-	}
-
-	if (error != cudaSuccess)
-	{
-		std::cerr << "cudaGetDeviceProperties returned error code " << error << "\n";
-		exit(-1);
-	}
-}
-#endif
 
 
 //create the initial model from the specified receptor files
@@ -893,7 +898,10 @@ Thank you!\n";
 		std::string autobox_ligand;
 		std::string flexdist_ligand;
 		std::string builtin_scoring;
-		int device = 0;
+		std::string device_list = "0";
+		int gpu_threads = 0;
+		bool gpu_fp64 = false;
+		int gpu_ligands_per_batch = 0;
 
 		// -0.035579, -0.005156, 0.840245, -0.035069, -0.587439, 0.05846
 		fl weight_gauss1 = -0.035579;
@@ -1002,7 +1010,16 @@ Thank you!\n";
 		("verbosity", value<int>(&settings.verbosity)->default_value(1),
 				"Adjust the verbosity of the output, default: 1")
     ("flex_hydrogens", bool_switch(&flex_hydrogens),
-        "Enable torsions effecting only hydrogens (e.g. OH groups). This is stupid but provides compatibility with Vina.");
+        "Enable torsions effecting only hydrogens (e.g. OH groups). This is stupid but provides compatibility with Vina.")
+#ifdef SMINA_GPU
+		("gpu_threads", value<int>(&gpu_threads)->default_value(0),
+				"GPU threads per search chain (32, 64 or 128; 0 chooses automatically)")
+		("gpu_fp64", bool_switch(&gpu_fp64),
+				"Use double precision GPU kernels (for validation; slow on consumer GPUs)")
+		("gpu_batch", value<int>(&gpu_ligands_per_batch)->default_value(0),
+				"Ligands docked together on the GPU (0 chooses automatically)")
+#endif
+		;
 
 
 		options_description misc("Misc (optional)");
@@ -1021,8 +1038,9 @@ Thank you!\n";
 		("quiet,q", bool_switch(&quiet), "Suppress output messages")
 		("addH", value<bool>(&add_hydrogens),
 				"automatically add hydrogens in ligands (on by default)")
-			#ifdef SMINA_GPU
-				("device", value<int>(&device)->default_value(0), "GPU device to use")
+#ifdef SMINA_GPU
+				("device", value<std::string>(&device_list)->default_value("0"),
+						"GPU device(s) to use, comma separated (e.g. 0,1)")
 				("gpu", bool_switch(&gpu_on), "Turn on GPU acceleration")
 #endif
 				;
@@ -1105,10 +1123,6 @@ Thank you!\n";
 			print_atom_info(std::cout);
 			return 0;
 		}
-
-#ifdef SMINA_GPU
-		initializeCUDA(device);
-#endif
 
 		set_fixed_rotable_hydrogens(!flex_hydrogens);
 
@@ -1309,13 +1323,7 @@ Thank you!\n";
 
 		boost::shared_ptr<precalculate> prec;
 
-		if (gpu_on || approx == GPU)
-		{ //don't get a choice
-#ifdef SMINA_GPU
-		prec = boost::shared_ptr<precalculate>(new precalculate_gpu(wt, approx_factor));
-#endif
-		}
-		else if (approx == SplineApprox)
+		if (approx == SplineApprox)
 			prec = boost::shared_ptr<precalculate>(
 					new precalculate_splines(wt, approx_factor));
 		else if (approx == LinearApprox)
@@ -1324,6 +1332,24 @@ Thank you!\n";
 		else if (approx == Exact)
 			prec = boost::shared_ptr<precalculate>(
 					new precalculate_exact(wt));
+
+		gpusmina::GpuDocking* gpu_engine = NULL;
+#ifdef SMINA_GPU
+		boost::shared_ptr<gpusmina::GpuDocking> gpu;
+		if (gpu_on)
+		{
+			if (approx == Exact)
+				throw usage_error(
+						"--gpu requires the linear or spline approximation");
+			gpusmina::GpuSettings gs;
+			gs.devices = gpusmina::parse_devices(device_list);
+			gs.fp64 = gpu_fp64;
+			gs.threads_per_chain = gpu_threads;
+			gpu.reset(new gpusmina::GpuDocking(gs));
+			gpu_engine = gpu.get();
+			log << "Using " << gpu->description() << "\n";
+		}
+#endif
 
 		//setup single outfile
 		using namespace OpenBabel;
@@ -1358,6 +1384,114 @@ Thank you!\n";
 
 		boost::timer::cpu_timer time;
 		MolGetter mols(initm, add_hydrogens);
+
+		auto write_results = [&](std::vector<result_info>& results)
+		{
+			if (outfile)
+			{
+				//write out molecular data
+				for (unsigned j = 0, nr = results.size(); j < nr; j++)
+				{
+					results[j].write(outfile, outext, settings.include_atom_info, &wt, j+1);
+				}
+			}
+			if(outflex)
+			{
+				//write out flexible residue data data
+				for (unsigned j = 0, nr = results.size(); j < nr; j++)
+				{
+					results[j].writeFlex(outflex, outfext, j+1);
+				}
+			}
+			if (atomoutfile)
+			{
+				for (unsigned j = 0, m = results.size(); j < m; j++)
+				{
+					results[j].writeAtomValues(atomoutfile, &wt);
+				}
+			}
+		};
+
+#ifdef SMINA_GPU
+		//GPU docking of many ligands: the search and refinement of a whole
+		//batch of ligands run together on the GPU(s); each ligand is then
+		//finished (rescored, logged, written) in input order as above
+		const bool gpu_batch = gpu_engine && !settings.score_only
+				&& !settings.local_only && !settings.randomize_only;
+		if (gpu_batch)
+		{
+			const sz per_batch = gpu_ligands_per_batch > 0 ? gpu_ligands_per_batch
+					: std::max<sz>(1, gpu_engine->chains_per_batch()
+							/ std::max(1, settings.exhaustiveness));
+			const vec corner1(gd[0].begin, gd[1].begin, gd[2].begin);
+			const vec corner2(gd[0].end, gd[1].end, gd[2].end);
+			const vec authentic_v(settings.forcecap, settings.forcecap,
+					settings.forcecap);
+			const fl slope = 1e6; // main_procedure's cache and non_cache slope
+			const bool compute_atominfo = atomoutfile.is_open()
+					|| settings.include_atom_info;
+			std::vector<model*> batch;
+
+			auto flush = [&]()
+			{
+				if (batch.empty())
+					return;
+				boost::timer::cpu_timer btime;
+				std::vector<gpusmina::GpuDocking::DockJob> jobs(batch.size());
+				std::vector<gpusmina::GpuDocking::DockJob*> jobp;
+				VINA_FOR_IN(k, batch)
+				{
+					jobs[k].m = batch[k];
+					setup_search(*batch[k], settings, minparms, jobs[k].par);
+					jobp.push_back(&jobs[k]);
+				}
+				gpu_engine->dock_batch(jobp, *prec, gd, corner1, corner2,
+						settings.seed, user_grid, slope, authentic_v, true);
+				const double gpu_time = btime.elapsed().wall / 1e9 / batch.size();
+				VINA_FOR_IN(k, batch)
+				{
+					boost::timer::cpu_timer ftime;
+					model& m = *batch[k];
+					boost::optional<model> ref;
+					std::vector<result_info> results;
+					log << "Using random seed: " << settings.seed;
+					log.endl();
+					szv_grid_cache gridcache(m, prec->cutoff_sqr());
+					non_cache nc(gridcache, gd, prec.get(), slope);
+					finish_docking(m, ref, wt, *prec, nc, settings,
+							compute_atominfo, log, user_grid, results, jobs[k].out,
+							authentic_v);
+					std::cout << "Refine time "
+							<< gpu_time + ftime.elapsed().wall / 1e9 << "\n";
+					write_results(results);
+					delete batch[k];
+				}
+				batch.clear();
+			};
+
+			for (unsigned l = 0, nl = ligand_names.size(); l < nl; l++)
+			{
+				doing(settings.verbosity, "Reading input", log);
+				mols.setInputFile(ligand_names[l]);
+				model m;
+				while (no_lig || mols.readMoleculeIntoModel(m))
+				{
+					if (no_lig)
+					{
+						no_lig = false; //only go through loop once
+						m = initm;
+					}
+					done(settings.verbosity, log);
+					batch.push_back(new model(m));
+					if (batch.size() >= per_batch)
+						flush();
+				}
+			}
+			flush();
+			ligand_names.clear(); // done; skip the per-ligand loop below
+		}
+#endif
+
 		//loop over input ligands
 		for (unsigned l = 0, nl = ligand_names.size(); l < nl; l++)
 		{
@@ -1389,32 +1523,10 @@ Thank you!\n";
 
 				main_procedure(m, *prec, ref, settings,
 						false, // no_cache == false
-						atomoutfile.is_open() || settings.include_atom_info, gpu_on,
+						atomoutfile.is_open() || settings.include_atom_info, gpu_engine,
 						gd,minparms, wt,log, results, user_grid);
 
-				if (outfile)
-				{
-					//write out molecular data
-					for (unsigned j = 0, nr = results.size(); j < nr; j++)
-					{
-						results[j].write(outfile, outext, settings.include_atom_info, &wt, j+1);
-					}
-				}
-				if(outflex)
-				{
-					//write out flexible residue data data
-					for (unsigned j = 0, nr = results.size(); j < nr; j++)
-					{
-						results[j].writeFlex(outflex, outfext, j+1);
-					}
-				}
-				if (atomoutfile)
-				{
-					for (unsigned j = 0, m = results.size(); j < m; j++)
-					{
-						results[j].writeAtomValues(atomoutfile, &wt);
-					}
-				}
+				write_results(results);
 				i++;
 			}
 		}

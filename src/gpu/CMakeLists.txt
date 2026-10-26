@@ -8,7 +8,7 @@ target_include_directories(sminagpu_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
 target_link_libraries(sminagpu_kernels PUBLIC CUDA::cudart)
 
 # host glue, against the production CPU library
-add_library(sminagpu STATIC gpu_flatten.cpp gpu_search.cpp)
+add_library(sminagpu STATIC gpu_flatten.cpp gpu_search.cpp gpu_docking.cpp)
 target_link_libraries(sminagpu PUBLIC sminalib sminagpu_kernels)
 
 # validation variant: CPU library with portable_math transcendental functions

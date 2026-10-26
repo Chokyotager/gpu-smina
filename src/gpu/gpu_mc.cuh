@@ -148,10 +148,12 @@ struct Objective // quasi_newton_aux
 	const DevTables<T>& tb;
 	const InterContext<T>& ic;
 	const T* v;
+	T slope; // non_cache::slope / cache slope
 	EvalScratch<T>& ws;
 	__device__ Objective(const ModelView<T>& mv_, const DevTables<T>& tb_,
-			const InterContext<T>& ic_, const T* v_, EvalScratch<T>& ws_) :
-			mv(mv_), tb(tb_), ic(ic_), v(v_), ws(ws_)
+			const InterContext<T>& ic_, const T* v_, T slope_,
+			EvalScratch<T>& ws_) :
+			mv(mv_), tb(tb_), ic(ic_), v(v_), slope(slope_), ws(ws_)
 	{
 	}
 };
@@ -159,7 +161,7 @@ struct Objective // quasi_newton_aux
 template<typename T, bool ORDERED, int TPC> __device__ __forceinline__ T evaluate(
 		const Objective<T>& f, const T* x, T* g, const Group<TPC>& G)
 {
-	T e = eval_deriv<T, ORDERED>(f.mv, f.tb, f.ic, f.v, x, g, f.ws, G);
+	T e = eval_deriv<T, ORDERED>(f.mv, f.tb, f.ic, f.v, f.slope, x, g, f.ws, G);
 #ifdef GPU_TRACE_EVALS
 	if (G.rank == 0 && blockIdx.x == 0 && threadIdx.x == 0)
 		printf("GPUEVAL %.17g\n", double(e));
@@ -590,8 +592,8 @@ template<typename T, bool ORDERED, int TPC> __device__ void monte_carlo_chain(
 			T(prm.hunt_cap[2])};
 	const T authentic_v[3] = {T(prm.authentic_v[0]), T(prm.authentic_v[1]),
 			T(prm.authentic_v[2])};
-	const Objective<T> f_hunt(mv, tb, ic, hunt_cap, ws);
-	const Objective<T> f_auth(mv, tb, ic, authentic_v, ws);
+	const Objective<T> f_hunt(mv, tb, ic, hunt_cap, ic.slope, ws);
+	const Objective<T> f_auth(mv, tb, ic, authentic_v, ic.slope, ws);
 	const int csz = mv.d.conf_size;
 
 	PROF_START(tmc);
@@ -637,6 +639,55 @@ template<typename T, bool ORDERED, int TPC> __device__ void monte_carlo_chain(
 		}
 	}
 	PROF_ADD(PROF_MC_TOTAL, tmc);
+}
+
+// non_cache::within: every movable heavy atom inside the box (+ margin)
+template<typename T, int TPC> __device__ bool within_box(const ModelView<T>& mv,
+		const DevReceptor<T>& rec, const EvalScratch<T>& ws, T margin,
+		const Group<TPC>& G)
+{
+	int outside = 0;
+	for (int k = G.rank; k < mv.d.num_heavy; k += TPC)
+	{
+		const int a = mv.heavy[k];
+		for (int j = 0; j < 3; j++)
+			if (rec.gd_enabled[j])
+			{
+				const T c = ws.coords[3 * a + j];
+				if (c < rec.gd_begin[j] - margin || c > rec.gd_end[j] + margin)
+					outside = 1;
+			}
+	}
+	return G.sum(outside) == 0;
+}
+
+// main.cpp refine_structure: bfgs on the non_cache back end with the slope
+// raised tenfold (from 10, at most 5 tries) until the pose is in the box.
+// Leaves the final heavy atom coordinates in `coords`; returns the energy,
+// or the type's max for poses that never got inside.
+template<typename T, bool ORDERED, int TPC> __device__ T refine_structure(
+		const ModelView<T>& mv, const DevTables<T>& tb,
+		const InterContext<T>& ic, const T cap[3], T* conf,
+		const BFGSWork<T>& w, const MinParams& prm, EvalScratch<T>& ws,
+		T* coords, const Group<TPC>& G)
+{
+	T slope = 10;
+	T e = 0;
+	bool in_box = false;
+	for (int p = 0; p < 5; p++)
+	{
+		const Objective<T> f(mv, tb, ic, cap, slope, ws);
+		e = bfgs<T, ORDERED>(f, conf, w, prm, G);
+		set_conf(mv, conf, ws, G);
+		in_box = within_box(mv, ic.rec, ws, T(0.0001), G);
+		if (in_box)
+			break;
+		slope *= 10;
+	}
+	heavy_coords(mv, ws, coords, G);
+	if (!in_box)
+		e = max_value<T>();
+	return e;
 }
 
 } // namespace gpusmina

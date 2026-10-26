@@ -128,6 +128,33 @@ SharedPlan plan_shared(const void* kernel, const DeviceModels<T>& models,
 	return p;
 }
 
+// Blocks are dispatched in index order as SMs become free; ordering them by
+// decreasing estimated cost (longest first) shortens the tail of a launch
+// whose items differ in length.  cost(item) is any monotone estimate.
+static void order_by_cost(std::vector<BlockTask>& tasks,
+		const std::vector<double>& item_cost)
+{
+	std::vector<std::pair<double, int> > order;
+	for (size_t t = 0; t < tasks.size(); t++)
+	{
+		double c = 0;
+		for (int i = 0; i < tasks[t].count; i++)
+			c = std::max(c, item_cost[tasks[t].first + i]);
+		order.push_back(std::make_pair(-c, int(t)));
+	}
+	std::stable_sort(order.begin(), order.end());
+	std::vector<BlockTask> sorted;
+	for (size_t t = 0; t < order.size(); t++)
+		sorted.push_back(tasks[order[t].second]);
+	tasks.swap(sorted);
+}
+
+// work of one evaluation of a model
+static double eval_cost(const ModelDesc& d)
+{
+	return double(d.num_pairs) + 8.0 * d.num_movable + 4.0 * d.num_frames;
+}
+
 // items -> blocks of at most `per_block` consecutive items of one model
 static std::vector<BlockTask> make_tasks(const std::vector<int>& item_model,
 		int per_block)
@@ -242,7 +269,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, MinBlocks<TPC>::value) eval_con
 	const ModelView<T>& mv = *mvp;
 	const T v[3] = {v0, v1, v2};
 	T* g = out_g + size_t(c) * mv.d.change_size;
-	T e = eval_deriv<T, Ordered<T>::value>(mv, tb, ic, v,
+	T e = eval_deriv<T, Ordered<T>::value>(mv, tb, ic, v, ic.slope,
 			confs + size_t(c) * mv.d.conf_size, g, gd->ws, G);
 	if (G.rank == 0)
 		out_e[c] = e;
@@ -395,7 +422,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, MinBlocks<TPC>::value) monte_ca
 		int* chain_imem, const __grid_constant__ ChainOffsets co,
 		const __grid_constant__ GlobalScratch<T> gs,
 		const __grid_constant__ ScratchOffsets so, int* error,
-		unsigned* progress)
+		unsigned* progress, const uint2* chain_limits)
 {
 	Group<TPC> G;
 	int chain;
@@ -415,7 +442,10 @@ __global__ void __launch_bounds__(BLOCK_THREADS, MinBlocks<TPC>::value) monte_ca
 	for (int i = G.rank; i < 3 * mv.d.num_frames; i += TPC)
 		gd->ws.frame_origin[i] = fo0[i];
 	G.sync();
-	monte_carlo_chain<T, Ordered<T>::value>(mv, tb, ic, prm, gd->cv, gd->ws,
+	MCParams p = prm;
+	p.num_steps = chain_limits[chain].x;
+	p.min.maxiters = chain_limits[chain].y;
+	monte_carlo_chain<T, Ordered<T>::value>(mv, tb, ic, p, gd->cv, gd->ws,
 			rngs[chain], G, progress);
 }
 
@@ -424,9 +454,11 @@ static void launch_monte_carlo(const DeviceModels<T>& models,
 		const std::vector<int>& cmodel, const DeviceTables<T>& tables,
 		const InterContext<T>& ic, const MCParams& params,
 		const ScratchOffsets& so, const ChainOffsets& co, DevBuf& drng,
-		DevBuf& dmem, DevBuf& dimem, DevBuf& derr, unsigned* dprogress)
+		DevBuf& dmem, DevBuf& dimem, DevBuf& derr, unsigned* dprogress,
+		DevBuf& dlimits, const std::vector<double>& cost)
 {
 	std::vector<BlockTask> tasks = make_tasks(cmodel, BLOCK_THREADS / TPC);
+	order_by_cost(tasks, cost);
 	SharedPlan plan = plan_shared<T, TPC>(
 			(const void*) monte_carlo_kernel<T, TPC>, models, tasks,
 			so.total + co.out_conf, so.pair_total);
@@ -437,7 +469,7 @@ static void launch_monte_carlo(const DeviceModels<T>& models,
 	monte_carlo_kernel<T, TPC><<<int(tasks.size()), BLOCK_THREADS, plan.total>>>(
 			models.dev, dtasks.get<BlockTask>(), plan, tables.dev, ic, params,
 			drng.get<MTState>(), dmem.get<T>(), dimem.get<int>(), co, gs, so,
-			derr.get<int>(), dprogress);
+			derr.get<int>(), dprogress, dlimits.get<uint2>());
 	cuda_check(cudaGetLastError(), "monte_carlo_kernel launch");
 	cuda_check(cudaDeviceSynchronize(), "monte_carlo_kernel");
 }
@@ -460,16 +492,25 @@ void run_monte_carlo(const DeviceModels<T>& models,
 
 	std::vector<int> cmodel(nchains);
 	std::vector<MTState> rng(nchains);
+	std::vector<uint2> limits(nchains);
+	std::vector<double> cost(nchains);
 	std::vector<T> mem(size_t(nchains) * co.total, T(0));
 	for (int c = 0; c < nchains; c++)
 	{
 		cmodel[c] = chains[c].model;
 		rng[c] = chains[c].rng;
+		limits[c].x = chains[c].num_steps ? chains[c].num_steps
+				: params.num_steps;
+		limits[c].y = chains[c].maxiters ? chains[c].maxiters
+				: params.min.maxiters;
+		cost[c] = double(limits[c].x) * limits[c].y
+				* eval_cost(models.host_desc[cmodel[c]]);
 		for (size_t i = 0; i < chains[c].conf.size(); i++)
 			mem[size_t(c) * co.total + co.tmp + i] = T(chains[c].conf[i]);
 	}
-	DevBuf drng, dmem, dimem, derr;
+	DevBuf drng, dmem, dimem, derr, dlimits;
 	drng.upload(&rng[0], sizeof(MTState) * nchains);
+	dlimits.upload(&limits[0], sizeof(uint2) * nchains);
 	dmem.upload(&mem[0], sizeof(T) * mem.size());
 	dimem.alloc(sizeof(int) * size_t(nchains) * co.int_total);
 	dimem.zero();
@@ -483,13 +524,13 @@ void run_monte_carlo(const DeviceModels<T>& models,
 
 	if (threads_per_chain >= 128)
 		launch_monte_carlo<T, 128>(models, cmodel, tables, ic, params, so, co,
-				drng, dmem, dimem, derr, dprogress);
+				drng, dmem, dimem, derr, dprogress, dlimits, cost);
 	else if (threads_per_chain >= 64)
 		launch_monte_carlo<T, 64>(models, cmodel, tables, ic, params, so, co,
-				drng, dmem, dimem, derr, dprogress);
+				drng, dmem, dimem, derr, dprogress, dlimits, cost);
 	else
 		launch_monte_carlo<T, 32>(models, cmodel, tables, ic, params, so, co,
-				drng, dmem, dimem, derr, dprogress);
+				drng, dmem, dimem, derr, dprogress, dlimits, cost);
 #ifdef GPU_PROFILE
 	report_profile();
 #endif
@@ -528,7 +569,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, MinBlocks<TPC>::value) bfgs_ker
 		const __grid_constant__ MinParams prm, T v0, T v1, T v2, T* chain_mem,
 		int* chain_imem, const __grid_constant__ ChainOffsets co,
 		const __grid_constant__ GlobalScratch<T> gs,
-		const __grid_constant__ ScratchOffsets so, int* error, T* out_e)
+		const __grid_constant__ ScratchOffsets so, int* error, T* out_e,
+		int refine, T* out_coords, int max_heavy, const unsigned* item_maxiters)
 {
 	Group<TPC> G;
 	int c;
@@ -541,8 +583,21 @@ __global__ void __launch_bounds__(BLOCK_THREADS, MinBlocks<TPC>::value) bfgs_ker
 	if (plan.hot_shared)
 		copy_n(gd->cv.tmp, gd->mem + co.tmp, mv.d.conf_size, G);
 	const T v[3] = {v0, v1, v2};
-	const Objective<T> f(mv, tb, ic, v, gd->ws);
-	T e = bfgs<T, Ordered<T>::value>(f, gd->cv.tmp, gd->cv.work, prm, G);
+	MinParams p = prm;
+	if (item_maxiters)
+		p.maxiters = item_maxiters[c];
+	T e;
+	if (refine)
+		e = refine_structure<T, Ordered<T>::value>(mv, tb, ic, v, gd->cv.tmp,
+				gd->cv.work, p, gd->ws, gd->cv.coords, G);
+	else
+	{
+		const Objective<T> f(mv, tb, ic, v, ic.slope, gd->ws);
+		e = bfgs<T, Ordered<T>::value>(f, gd->cv.tmp, gd->cv.work, p, G);
+	}
+	if (refine)
+		for (int i = G.rank; i < 3 * mv.d.num_heavy; i += TPC)
+			out_coords[size_t(c) * 3 * max_heavy + i] = gd->cv.coords[i];
 	if (plan.hot_shared)
 		copy_n(gd->mem + co.tmp, gd->cv.tmp, mv.d.conf_size, G);
 	if (G.rank == 0)
@@ -554,7 +609,8 @@ static void launch_bfgs(const DeviceModels<T>& models,
 		const std::vector<int>& model_of, const DeviceTables<T>& tables,
 		const InterContext<T>& ic, const MinParams& params, const double v[3],
 		const ScratchOffsets& so, const ChainOffsets& co, DevBuf& dmem,
-		DevBuf& dimem, DevBuf& derr, DevBuf& de)
+		DevBuf& dimem, DevBuf& derr, DevBuf& de, int refine, DevBuf& dcoords,
+		const unsigned* dmaxiters)
 {
 	std::vector<BlockTask> tasks = make_tasks(model_of, BLOCK_THREADS / TPC);
 	SharedPlan plan = plan_shared<T, TPC>((const void*) bfgs_kernel<T, TPC>,
@@ -566,16 +622,20 @@ static void launch_bfgs(const DeviceModels<T>& models,
 	bfgs_kernel<T, TPC><<<int(tasks.size()), BLOCK_THREADS, plan.total>>>(
 			models.dev, dtasks.get<BlockTask>(), plan, tables.dev, ic, params,
 			T(v[0]), T(v[1]), T(v[2]), dmem.get<T>(), dimem.get<int>(), co, gs, so,
-			derr.get<int>(), de.get<T>());
+			derr.get<int>(), de.get<T>(), refine, dcoords.get<T>(),
+			models.max_heavy, dmaxiters);
 	cuda_check(cudaGetLastError(), "bfgs_kernel launch");
 	cuda_check(cudaDeviceSynchronize(), "bfgs_kernel");
 }
 
 template<typename T>
-bool run_bfgs(const DeviceModels<T>& models, const DeviceTables<T>& tables,
-		const InterContext<T>& ic, const MinParams& params, const double v[3],
+static bool run_minimizer(const DeviceModels<T>& models,
+		const DeviceTables<T>& tables, const InterContext<T>& ic,
+		const MinParams& params, const double v[3],
 		const std::vector<int>& model_of, std::vector<std::vector<double> >& confs,
-		std::vector<double>& e, int threads_per_chain)
+		std::vector<double>& e, int threads_per_chain, int refine,
+		std::vector<std::vector<double> >* coords,
+		const std::vector<unsigned>& maxiters)
 {
 	const int n = int(confs.size());
 	e.assign(n, 0);
@@ -589,33 +649,74 @@ bool run_bfgs(const DeviceModels<T>& models, const DeviceTables<T>& tables,
 	for (int c = 0; c < n; c++)
 		for (size_t i = 0; i < confs[c].size(); i++)
 			mem[size_t(c) * co.total + co.tmp + i] = T(confs[c][i]);
-	DevBuf dmem, dimem, derr, de;
+	DevBuf dmem, dimem, derr, de, dcoords, dmaxiters;
+	if (!maxiters.empty())
+		dmaxiters.upload(&maxiters[0], sizeof(unsigned) * n);
+	const unsigned* pmax = maxiters.empty() ? (const unsigned*) 0
+			: dmaxiters.get<unsigned>();
 	dmem.upload(&mem[0], sizeof(T) * mem.size());
 	dimem.alloc(sizeof(int) * size_t(n) * co.int_total);
 	de.alloc(sizeof(T) * n);
+	if (refine)
+		dcoords.alloc(sizeof(T) * size_t(n) * 3 * models.max_heavy);
 	int zero = 0;
 	derr.upload(&zero, sizeof(int));
 	if (threads_per_chain >= 128)
 		launch_bfgs<T, 128>(models, model_of, tables, ic, params, v, so, co, dmem,
-				dimem, derr, de);
+				dimem, derr, de, refine, dcoords, pmax);
 	else if (threads_per_chain >= 64)
 		launch_bfgs<T, 64>(models, model_of, tables, ic, params, v, so, co, dmem,
-				dimem, derr, de);
+				dimem, derr, de, refine, dcoords, pmax);
 	else
 		launch_bfgs<T, 32>(models, model_of, tables, ic, params, v, so, co, dmem,
-				dimem, derr, de);
+				dimem, derr, de, refine, dcoords, pmax);
 	dmem.download(&mem[0], sizeof(T) * mem.size());
 	std::vector<T> he(n);
 	de.download(&he[0], sizeof(T) * n);
+	std::vector<T> hc;
+	if (refine)
+	{
+		hc.resize(size_t(n) * 3 * models.max_heavy);
+		dcoords.download(&hc[0], sizeof(T) * hc.size());
+		coords->assign(n, std::vector<double>());
+	}
 	for (int c = 0; c < n; c++)
 	{
 		e[c] = he[c];
 		for (size_t i = 0; i < confs[c].size(); i++)
 			confs[c][i] = mem[size_t(c) * co.total + co.tmp + i];
+		if (refine)
+		{
+			const ModelDesc& d = models.host_desc[model_of[c]];
+			const T* src = &hc[size_t(c) * 3 * models.max_heavy];
+			(*coords)[c].assign(src, src + 3 * d.num_heavy);
+		}
 	}
 	int err = 0;
 	derr.download(&err, sizeof(int));
 	return err == 0;
+}
+
+template<typename T>
+bool run_bfgs(const DeviceModels<T>& models, const DeviceTables<T>& tables,
+		const InterContext<T>& ic, const MinParams& params, const double v[3],
+		const std::vector<int>& model_of, std::vector<std::vector<double> >& confs,
+		std::vector<double>& e, int threads_per_chain)
+{
+	return run_minimizer(models, tables, ic, params, v, model_of, confs, e,
+			threads_per_chain, 0, (std::vector<std::vector<double> >*) 0,
+			std::vector<unsigned>());
+}
+
+template<typename T>
+bool run_refine(const DeviceModels<T>& models, const DeviceTables<T>& tables,
+		const InterContext<T>& ic, const MinParams& params, const double cap[3],
+		const std::vector<int>& model_of, std::vector<std::vector<double> >& confs,
+		std::vector<double>& e, std::vector<std::vector<double> >& coords,
+		int threads_per_chain, const std::vector<unsigned>& maxiters)
+{
+	return run_minimizer(models, tables, ic, params, cap, model_of, confs, e,
+			threads_per_chain, 1, &coords, maxiters);
 }
 
 template bool eval_confs<GPU_PRECISION>(const DeviceModels<GPU_PRECISION>&,
@@ -632,5 +733,10 @@ template bool run_bfgs<GPU_PRECISION>(const DeviceModels<GPU_PRECISION>&,
 		const DeviceTables<GPU_PRECISION>&, const InterContext<GPU_PRECISION>&,
 		const MinParams&, const double[3], const std::vector<int>&,
 		std::vector<std::vector<double> >&, std::vector<double>&, int);
+template bool run_refine<GPU_PRECISION>(const DeviceModels<GPU_PRECISION>&,
+		const DeviceTables<GPU_PRECISION>&, const InterContext<GPU_PRECISION>&,
+		const MinParams&, const double[3], const std::vector<int>&,
+		std::vector<std::vector<double> >&, std::vector<double>&,
+		std::vector<std::vector<double> >&, int, const std::vector<unsigned>&);
 
 } // namespace gpusmina

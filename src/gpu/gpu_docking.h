@@ -1,0 +1,82 @@
+/*
+ * GPU replacements for the expensive parts of smina's search, used by main
+ * when --gpu is given:
+ *   parallel_mc::operator()   -> GpuDocking::parallel_mc
+ *   refine_structure (main)   -> GpuDocking::refine
+ * Everything else (input, final scoring in double precision, clustering,
+ * output) stays on the CPU code path.
+ */
+
+#ifndef SMINA_GPU_DOCKING_H
+#define SMINA_GPU_DOCKING_H
+
+#include <string>
+#include <vector>
+#include "model.h"
+#include "parallel_mc.h"
+#include "precalculate.h"
+#include "grid.h"
+
+namespace gpusmina
+{
+
+struct GpuSettings
+{
+	std::vector<int> devices; // CUDA device ordinals
+	bool fp64; // double precision kernels (validation)
+	int threads_per_chain; // 0: automatic
+	GpuSettings() : fp64(false), threads_per_chain(0) {}
+};
+
+// parse "0,1" into device ordinals
+std::vector<int> parse_devices(const std::string& s);
+
+struct EngineBase;
+
+class GpuDocking
+{
+	GpuSettings settings;
+	std::vector<EngineBase*> engines; // one per device
+	GpuDocking(const GpuDocking&);
+	GpuDocking& operator=(const GpuDocking&);
+public:
+	explicit GpuDocking(const GpuSettings& s);
+	~GpuDocking();
+
+	// parallel_mc::operator(): the same chains (seeded from `generator`),
+	// merged into `out` like merge_output_containers
+	void parallel_mc(const ::parallel_mc& par, const model& m,
+			output_container& out, const precalculate& p, const grid_dims& gd,
+			const vec& corner1, const vec& corner2, rng& generator,
+			const grid& user_grid, double cache_slope);
+
+	// refine_structure(m, p, nc, out[i], cap, minparm, user_grid) for every
+	// pose in `poses`; the non_cache box is `gd`
+	void refine(const model& m, const precalculate& p, const grid_dims& gd,
+			std::vector<output_type*>& poses, const vec& cap,
+			const minimization_params& minparm, const grid& user_grid);
+
+	// Batched docking of many ligands (virtual screening): for every job, the
+	// equivalent of parallel_mc (seeded with a fresh rng(seed) like
+	// do_search) followed by refine_structure of every pose.  Jobs are split
+	// over the devices.
+	struct DockJob
+	{
+		const model* m;
+		::parallel_mc par; // this ligand's search parameters
+		output_container out; // merged, refined poses
+	};
+	void dock_batch(std::vector<DockJob*>& jobs, const precalculate& p,
+			const grid_dims& gd, const vec& corner1, const vec& corner2,
+			int seed, const grid& user_grid, double cache_slope, const vec& cap,
+			bool display_progress);
+
+	// chains that keep all devices busy; batches should provide this many
+	size_t chains_per_batch() const;
+
+	std::string description() const;
+};
+
+} // namespace gpusmina
+
+#endif

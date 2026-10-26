@@ -11,6 +11,7 @@
  */
 
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <boost/timer/timer.hpp>
 #include "test_common.h"
@@ -115,7 +116,7 @@ int main(int argc, char* argv[])
 		return 2;
 	}
 	std::string recname = argv[1], ligname = argv[2];
-	std::string scoring, approx = "linear", flexres;
+	std::string scoring, approx = "linear", flexres, autobox;
 	std::vector<int> steps = parse_list("1,10,100");
 	int tasks = 4, seed = 42, tpc = 32;
 	double factor = 32;
@@ -138,6 +139,8 @@ int main(int argc, char* argv[])
 			factor = atof(argv[i + 1]);
 		else if (o == "--flexres")
 			flexres = argv[i + 1];
+		else if (o == "--autobox_ligand")
+			autobox = argv[i + 1];
 		else
 		{
 			std::cerr << "unknown option " << o << "\n";
@@ -161,6 +164,29 @@ int main(int argc, char* argv[])
 	weighted_terms wt(&t, t.weights());
 	boost::shared_ptr<precalculate> prec = gputest::make_prec(wt, approx, factor);
 	grid_dims gd = gputest::ligand_box(m, 4);
+	if (autobox.size())
+	{
+		// main.cpp setup_autobox (+4 A) and grid_dims construction
+		using namespace OpenBabel;
+		obmol_opener opener;
+		OBConversion conv;
+		opener.openForInput(conv, autobox);
+		OBMol mol;
+		Box b;
+		while (conv.Read(&mol))
+			b.add_ligand_box(mol);
+		vec center((b.max_x + b.min_x) / 2.0, (b.max_y + b.min_y) / 2.0,
+				(b.max_z + b.min_z) / 2.0);
+		b.expand(4);
+		vec span(b.max_x - b.min_x, b.max_y - b.min_y, b.max_z - b.min_z);
+		VINA_FOR_IN(i, gd)
+		{
+			gd[i].n = sz(std::ceil(span[i] / 0.375));
+			fl real_span = 0.375 * gd[i].n;
+			gd[i].begin = center[i] - real_span / 2;
+			gd[i].end = gd[i].begin + real_span;
+		}
+	}
 	vec c1(gd[0].begin, gd[1].begin, gd[2].begin);
 	vec c2(gd[0].end, gd[1].end, gd[2].end);
 	grid user_grid;
@@ -208,6 +234,21 @@ int main(int argc, char* argv[])
 				<< fm.nbr.size() << "  max per atom " << maxdeg << "  frames "
 				<< fm.frames.size() << "  levels " << fm.num_levels() << "\n";
 	}
+	{
+		// fingerprint of the parsed model (tree, atom order, pairs)
+		unsigned long long h = 1469598103934665603ULL;
+		auto mix = [&](long long v) { h = (h ^ (unsigned long long) v) * 1099511628211ULL; };
+		for (size_t i = 0; i < fm.atom_type.size(); i++)
+			mix(fm.atom_type[i]), mix(fm.atom_frame[i]), mix(llround(fm.atom_local[3 * i] * 1e4));
+		for (size_t i = 0; i < fm.pairs.size(); i++)
+			mix(fm.pairs[i].a), mix(fm.pairs[i].b);
+		for (size_t i = 0; i < fm.frames.size(); i++)
+			mix(fm.frames[i].parent), mix(fm.frames[i].begin), mix(fm.frames[i].end);
+		std::cout << "model fingerprint " << std::hex << h << std::dec << "\n";
+	}
+	std::cout << "box " << gd[0].begin << " " << gd[1].begin << " "
+			<< gd[2].begin << " / " << gd[0].end << " " << gd[1].end << " "
+			<< gd[2].end << "\n";
 	std::cout << "atoms " << m.num_movable_atoms() << "  dof "
 			<< m.get_size().num_degrees_of_freedom() << "  full run "
 			<< full_steps << " steps, bfgs maxiters " << minparm.maxiters << "\n";
@@ -288,6 +329,80 @@ int main(int argc, char* argv[])
 						<< ge[i] << " dconf " << dc << "\n";
 		}
 		std::cout << "bfgs fp64: " << same << "/" << cs.size() << " identical\n";
+	}
+
+	if (getenv("GPU_TEST_DETERMINISM"))
+	{
+		// float build twice with the same inputs must agree exactly
+		par.mc.num_steps = steps[0];
+		std::vector<output_container> a, b;
+		run_gpu(m, fm, ft, g32, par, seeds, c1, c2, a, tpc);
+		int diff = 0;
+		for (int rep = 0; rep < 5; rep++)
+		{
+			run_gpu(m, fm, ft, g32, par, seeds, c1, c2, b, tpc);
+			for (int t = 0; t < tasks; t++)
+			{
+				bool same = a[t].size() == b[t].size();
+				for (size_t k = 0; same && k < a[t].size(); k++)
+					same = a[t][k].e == b[t][k].e;
+				diff += !same;
+			}
+		}
+		std::cout << "fp32 determinism: " << diff << " differing chain results in "
+				<< 5 * tasks << "\n";
+		return diff != 0;
+	}
+
+	if (getenv("GPU_TEST_REFINE_DET"))
+	{
+		// refine_structure on the GPU twice from the same poses
+		int tpcs[2] = {32, 128};
+		std::vector<const FlatModel*> fms(1, &fm);
+		DeviceModels<float> dmodels;
+		dmodels.upload(fms);
+		DeviceTables<float> dtables;
+		dtables.upload(ft);
+		FlatReceptor fr = gpu_model_flattener::flatten_receptor(m, gd,
+				prec->cutoff_sqr());
+		DeviceReceptor<float> drec;
+		drec.upload(fr, geo);
+		InterContext<float> ic;
+		std::memset(&ic, 0, sizeof(ic));
+		ic.use_cache = 0;
+		ic.rec = drec.dev;
+		ic.ug.initialized = 0;
+		rng gen(5);
+		std::vector<std::vector<double> > start;
+		for (int i = 0; i < 64; i++)
+		{
+			conf c(m.get_size());
+			c.randomize(c1, c2, gen);
+			start.push_back(std::vector<double>(fm.conf_size));
+			conf_to_flat(c, fm, &start.back()[0]);
+		}
+		MCParams prm = mc_params(par.mc);
+		const double v[3] = {1000, 1000, 1000};
+		for (int ti = 0; ti < 2; ti++)
+		{
+			int diff = 0;
+			std::vector<double> e0;
+			for (int rep = 0; rep < 4; rep++)
+			{
+				std::vector<std::vector<double> > confs = start, coords;
+				std::vector<double> e;
+				run_refine(dmodels, dtables, ic, prm.min, v,
+						std::vector<int>(start.size(), 0), confs, e, coords, tpcs[ti]);
+				if (rep == 0)
+					e0 = e;
+				else
+					for (size_t i = 0; i < e.size(); i++)
+						diff += e[i] != e0[i];
+			}
+			std::cout << "refine tpc " << tpcs[ti] << ": " << diff
+					<< " differing energies in " << 3 * start.size() << "\n";
+		}
+		return 0;
 	}
 
 	if (getenv("GPU_TEST_THROUGHPUT"))

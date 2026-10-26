@@ -830,7 +830,7 @@ __device__ unsigned long long g_prof[PROF_COUNT];
 // model::eval_deriv; v = {intra-ligand, intermolecular, other pairs}
 template<typename T, bool ORDERED, int TPC> __device__ T eval_deriv(
 		const ModelView<T>& mv, const DevTables<T>& tb,
-		const InterContext<T>& ic, const T v[3], const T* conf, T* g,
+		const InterContext<T>& ic, const T v[3], T slope, const T* conf, T* g,
 		EvalScratch<T>& ws, const Group<TPC>& G)
 {
 	PROF_START(t0);
@@ -839,10 +839,10 @@ template<typename T, bool ORDERED, int TPC> __device__ T eval_deriv(
 	PROF_START(t1);
 	T e;
 	if (ic.use_cache)
-		e = cache_eval_deriv<T, ORDERED>(mv, ic.grids, ic.slope, v[1], ws, G);
+		e = cache_eval_deriv<T, ORDERED>(mv, ic.grids, slope, v[1], ws, G);
 	else
-		e = non_cache_eval_deriv<T, ORDERED>(mv, ic.rec, tb, ic.ug, ic.slope,
-				v[1], ws, G);
+		e = non_cache_eval_deriv<T, ORDERED>(mv, ic.rec, tb, ic.ug, slope, v[1],
+				ws, G);
 	G.sync();
 	PROF_ADD(PROF_INTER, t1);
 	PROF_START(t2);

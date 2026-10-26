@@ -36,6 +36,9 @@ struct ChainInput
 	int model;
 	std::vector<double> conf;
 	MTState rng;
+	unsigned num_steps; // per-ligand search length (0: params.num_steps)
+	unsigned maxiters; // per-ligand bfgs iterations (0: params.min.maxiters)
+	ChainInput() : model(0), num_steps(0), maxiters(0) {}
 };
 
 // a chain's output container, sorted by energy
@@ -62,6 +65,19 @@ bool run_bfgs(const DeviceModels<T>& models, const DeviceTables<T>& tables,
 		const InterContext<T>& ic, const MinParams& params, const double v[3],
 		const std::vector<int>& model_of, std::vector<std::vector<double> >& confs,
 		std::vector<double>& e, int threads_per_chain = 32);
+
+// main.cpp refine_structure for every conf (non_cache back end in ic, v =
+// cap): bfgs with increasing slope until in the box.  Energies of poses that
+// never got inside are the precision's max; coords receives the final heavy
+// atom coordinates.
+// maxiters, if not empty, gives each conf its own iteration limit.
+template<typename T>
+bool run_refine(const DeviceModels<T>& models, const DeviceTables<T>& tables,
+		const InterContext<T>& ic, const MinParams& params, const double cap[3],
+		const std::vector<int>& model_of, std::vector<std::vector<double> >& confs,
+		std::vector<double>& e, std::vector<std::vector<double> >& coords,
+		int threads_per_chain = 32,
+		const std::vector<unsigned>& maxiters = std::vector<unsigned>());
 
 } // namespace gpusmina
 
