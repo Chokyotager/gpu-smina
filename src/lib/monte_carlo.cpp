@@ -25,6 +25,15 @@
 #include "mutate.h"
 #include "quasi_newton.h"
 
+// the GPU validation build compares CPU and GPU trajectories bit for bit and
+// needs both to use the same transcendental functions
+#ifdef SMINA_PORTABLE_MATH
+#include "portable_math.h"
+#define SMINA_MATH portable_math
+#else
+#define SMINA_MATH std
+#endif
+
 output_type monte_carlo::operator()(model& m, const precalculate& p, const igrid& ig, const vec& corner1, const vec& corner2, incrementable* increment_me, rng& generator, grid& user_grid) const {
 	output_container tmp;
 	this->operator()(m, tmp, p, ig, corner1, corner2, increment_me, generator, user_grid); // call the version that produces the whole container
@@ -34,7 +43,7 @@ output_type monte_carlo::operator()(model& m, const precalculate& p, const igrid
 
 bool metropolis_accept(fl old_f, fl new_f, fl temperature, rng& generator) {
 	if(new_f < old_f) return true;
-	const fl acceptance_probability = std::exp((old_f - new_f) / temperature);
+	const fl acceptance_probability = SMINA_MATH::exp((old_f - new_f) / temperature);
 	return random_fl(0, 1, generator) < acceptance_probability;
 }
 

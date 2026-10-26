@@ -8,6 +8,8 @@
 
 #include <vector>
 #include "gpu_device.h"
+#include "gpu_mc_structs.h"
+#include "gpu_rng.cuh"
 
 namespace gpusmina
 {
@@ -23,6 +25,39 @@ bool eval_confs(const DeviceModels<T>& models, int model,
 		const double v[3], const std::vector<double>& confs,
 		std::vector<double>& e, std::vector<double>& g,
 		std::vector<double>* coords = 0);
+
+// one Monte Carlo chain: its model, initial (randomized) conf and the state
+// of its random number generator after the randomization
+struct ChainInput
+{
+	int model;
+	std::vector<double> conf;
+	MTState rng;
+};
+
+// a chain's output container, sorted by energy
+struct ChainResult
+{
+	std::vector<double> e;
+	std::vector<std::vector<double> > conf;
+	std::vector<std::vector<double> > coords; // heavy atoms, 3 per atom
+};
+
+// monte_carlo::operator() for every chain (one warp each), using the cache
+// grids in ic.  progress, if given, counts completed MC steps (host-mapped).
+template<typename T>
+void run_monte_carlo(const DeviceModels<T>& models,
+		const DeviceTables<T>& tables, const InterContext<T>& ic,
+		const MCParams& params, const std::vector<ChainInput>& chains,
+		std::vector<ChainResult>& results, unsigned* progress = 0);
+
+// quasi_newton::operator() (bfgs) on every conf in place (one warp each);
+// returns the minimized energies.  Uses ic's back end (cache or non_cache).
+template<typename T>
+bool run_bfgs(const DeviceModels<T>& models, const DeviceTables<T>& tables,
+		const InterContext<T>& ic, const MinParams& params, const double v[3],
+		const std::vector<int>& model_of, std::vector<std::vector<double> >& confs,
+		std::vector<double>& e);
 
 } // namespace gpusmina
 

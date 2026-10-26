@@ -9,16 +9,21 @@
 
 #include <cfloat>
 #include "gpu_defs.h"
+#include "portable_math.h"
 
 namespace gpusmina
 {
 
 GPU_HD float gsqrt(float x) { return sqrtf(x); }
 GPU_HD double gsqrt(double x) { return sqrt(x); }
+// double precision is the validation build: use the same transcendental
+// functions as the CPU validation build (portable_math.h)
 GPU_HD float gsin(float x) { return sinf(x); }
-GPU_HD double gsin(double x) { return sin(x); }
+GPU_HD double gsin(double x) { return portable_math::sin(x); }
 GPU_HD float gcos(float x) { return cosf(x); }
-GPU_HD double gcos(double x) { return cos(x); }
+GPU_HD double gcos(double x) { return portable_math::cos(x); }
+GPU_HD float gacos(float x) { return acosf(x); }
+GPU_HD double gacos(double x) { return portable_math::acos(x); }
 GPU_HD float gceil(float x) { return ceilf(x); }
 GPU_HD double gceil(double x) { return ceil(x); }
 GPU_HD float gfloor(float x) { return floorf(x); }

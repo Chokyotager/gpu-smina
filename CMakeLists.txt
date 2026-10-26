@@ -47,10 +47,11 @@ list(TRANSFORM LIB_SOURCES PREPEND ${CMAKE_SOURCE_DIR}/src/lib/)
 add_library(sminalib STATIC ${LIB_SOURCES})
 target_include_directories(sminalib PUBLIC
   ${CMAKE_SOURCE_DIR}/src/lib ${OPENBABEL_INCLUDE_DIR})
-target_link_libraries(sminalib PUBLIC
+set(SMINA_LIB_DEPS
   ${OPENBABEL_LIBRARY} Boost::program_options Boost::thread Boost::system
   Boost::filesystem Boost::serialization Boost::iostreams Boost::timer
   Boost::regex Boost::date_time ZLIB::ZLIB Threads::Threads)
+target_link_libraries(sminalib PUBLIC ${SMINA_LIB_DEPS})
 # boost/progress.hpp is deprecated but still what smina uses
 target_compile_definitions(sminalib PUBLIC BOOST_TIMER_ENABLE_DEPRECATED
   BOOST_ALLOW_DEPRECATED_HEADERS)

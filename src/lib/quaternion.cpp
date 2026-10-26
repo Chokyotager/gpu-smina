@@ -22,6 +22,15 @@
 
 #include "quaternion.h"
 
+// the GPU validation build compares CPU and GPU trajectories bit for bit and
+// needs both to use the same transcendental functions
+#ifdef SMINA_PORTABLE_MATH
+#include "portable_math.h"
+#define SMINA_MATH portable_math
+#else
+#define SMINA_MATH std
+#endif
+
 
 bool eq(const qt& a, const qt& b) { // elementwise approximate equality - may return false for equivalent rotations
 	return eq(a.R_component_1(), b.R_component_1()) && \
@@ -34,8 +43,8 @@ qt angle_to_quaternion(const vec& axis, fl angle) { // axis is assumed to be a u
 	//assert(eq(tvmet::norm2(axis), 1));
 	assert(eq(axis.norm(), 1));
 	normalize_angle(angle); // this is probably only necessary if angles can be very big
-	fl c = std::cos(angle/2);
-	fl s = std::sin(angle/2);
+	fl c = SMINA_MATH::cos(angle/2);
+	fl s = SMINA_MATH::sin(angle/2);
 	return qt(c, s*axis[0], s*axis[1], s*axis[2]);
 }
 
@@ -55,11 +64,11 @@ vec quaternion_to_angle(const qt& q) {
 	assert(quaternion_is_normalized(q));
 	const fl c = q.R_component_1();
 	if(c > -1 && c < 1) { // c may in theory be outside [-1, 1] even with approximately normalized q, due to rounding errors
-		fl angle = 2*std::acos(c); // acos is in [0, pi]
+		fl angle = 2*SMINA_MATH::acos(c); // acos is in [0, pi]
 		if(angle > pi)
 			angle -= 2*pi; // now angle is in [-pi, pi]
 		vec axis(q.R_component_2(), q.R_component_3(), q.R_component_4());
-		fl s = std::sin(angle/2); // perhaps not very efficient to calculate sin of acos
+		fl s = SMINA_MATH::sin(angle/2); // perhaps not very efficient to calculate sin of acos
 		if(std::abs(s) < epsilon_fl)
 			return zero_vec;
 		axis *= (angle / s);
