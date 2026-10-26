@@ -86,8 +86,7 @@ void DeviceTables<T>::upload(const FlatTables& t)
 }
 
 template<typename T>
-void DeviceReceptor<T>::upload(const FlatReceptor& r,
-		const FlatGridGeometry& box)
+void DeviceReceptor<T>::upload(const FlatReceptor& r)
 {
 	upload_converted<T>(coords, r.coords);
 	upload_converted<int>(type, r.type);
@@ -103,9 +102,6 @@ void DeviceReceptor<T>::upload(const FlatReceptor& r,
 	{
 		dev.offset[i] = r.offset[i];
 		dev.dims[i] = r.dims[i];
-		dev.gd_begin[i] = T(box.gd_begin[i]);
-		dev.gd_end[i] = T(box.gd_end[i]);
-		dev.gd_enabled[i] = box.gd_enabled[i];
 	}
 }
 
@@ -234,7 +230,7 @@ void DeviceGrids<T>::build(const FlatReceptor& rec_for_grid,
 	DeviceTables<double> dtab;
 	dtab.upload(tables);
 	DeviceReceptor<double> drec;
-	drec.upload(rec_for_grid, geo);
+	drec.upload(rec_for_grid);
 	DeviceUserGrid<double> dug;
 	dug.upload(ug);
 	DevGridGeometry<double> dgeo;

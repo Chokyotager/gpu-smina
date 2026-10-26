@@ -53,7 +53,8 @@ struct DevUserGrid
 	const T* data;
 };
 
-// non_cache: receptor atoms near the box, 3 A cell lists, box bounds
+// non_cache: receptor atoms with 3 A cell lists (cells hold the atoms within
+// the cutoff of their brick, in receptor order)
 template<typename T>
 struct DevReceptor
 {
@@ -63,8 +64,15 @@ struct DevReceptor
 	int offset[3], dims[3];
 	const int* cell_start;
 	const int* cell_atoms;
-	T gd_begin[3], gd_end[3];
-	int gd_enabled[3];
+};
+
+// non_cache's search box (grid_dims begin / end; dimensions with n == 0
+// are unbounded)
+template<typename T>
+struct DevBox
+{
+	T begin[3], end[3];
+	int enabled[3];
 };
 
 // one model of the batch, resolved to direct pointers
@@ -111,6 +119,7 @@ struct InterContext
 	int use_cache; // cache (grids) or non_cache (receptor atoms)
 	DevGrids<T> grids;
 	DevReceptor<T> rec;
+	DevBox<T> box; // non_cache box (per-item boxes may override it)
 	DevUserGrid<T> ug;
 	T slope;
 };

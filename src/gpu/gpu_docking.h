@@ -36,7 +36,12 @@ struct EngineBase;
 class GpuDocking
 {
 	GpuSettings settings;
-	std::vector<EngineBase*> engines; // one per device
+	std::vector<EngineBase*> engines; // one per device (search precision)
+	// Local optimization (--minimize / --local_only) always runs in double
+	// precision: it iterates bfgs until |g|^2 < 1e-4, which float coordinate
+	// resolution (~5e-6 A) cannot reliably reach, so float minimizations
+	// stall at the iteration limit.  Created on first use.
+	std::vector<EngineBase*> local_engines;
 	GpuDocking(const GpuDocking&);
 	GpuDocking& operator=(const GpuDocking&);
 public:
@@ -70,6 +75,19 @@ public:
 			const grid_dims& gd, const vec& corner1, const vec& corner2,
 			int seed, const grid& user_grid, double cache_slope, const vec& cap,
 			bool display_progress);
+
+	// Batched local optimization (--local_only / --minimize): for every job,
+	// refine_structure of job.out (in: initial conf; out: conf, e, heavy
+	// atom coords) in the job's own box.
+	struct MinimizeJob
+	{
+		const model* m;
+		grid_dims gd;
+		minimization_params minparm;
+		output_type* out;
+	};
+	void minimize_batch(std::vector<MinimizeJob>& jobs, const precalculate& p,
+			const vec& cap, const grid& user_grid);
 
 	// chains that keep all devices busy; batches should provide this many
 	size_t chains_per_batch() const;

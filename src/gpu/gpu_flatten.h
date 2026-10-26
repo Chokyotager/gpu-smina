@@ -27,9 +27,8 @@ struct gpu_model_flattener
 
 	static FlatModel flatten_model(const model& m);
 	static FlatTables flatten_tables(const precalculate& p);
-	// relevant receptor atoms for box gd, with cell lists for non_cache
-	static FlatReceptor flatten_receptor(const model& m, const grid_dims& gd,
-			double cutoff_sqr);
+	// receptor atoms with cell lists for non_cache, valid for any box
+	static FlatReceptor flatten_receptor(const model& m, double cutoff_sqr);
 	// cell lists exactly as cache::populate builds them for its probes
 	static FlatReceptor flatten_receptor_for_grid(const model& m,
 			const grid_dims& gd, double cutoff_sqr);

@@ -363,14 +363,15 @@ int main(int argc, char* argv[])
 		dmodels.upload(fms);
 		DeviceTables<float> dtables;
 		dtables.upload(ft);
-		FlatReceptor fr = gpu_model_flattener::flatten_receptor(m, gd,
+		FlatReceptor fr = gpu_model_flattener::flatten_receptor(m,
 				prec->cutoff_sqr());
 		DeviceReceptor<float> drec;
-		drec.upload(fr, geo);
+		drec.upload(fr);
 		InterContext<float> ic;
 		std::memset(&ic, 0, sizeof(ic));
 		ic.use_cache = 0;
 		ic.rec = drec.dev;
+		ic.box = make_box<float>(geo);
 		ic.ug.initialized = 0;
 		rng gen(5);
 		std::vector<std::vector<double> > start;

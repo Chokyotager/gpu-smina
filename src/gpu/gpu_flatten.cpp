@@ -403,23 +403,44 @@ void add_relevant(const atomv& grid_atoms, const szv& relevant,
 } // namespace
 
 FlatReceptor gpu_model_flattener::flatten_receptor(const model& m,
-		const grid_dims& gd, double cutoff_sqr)
+		double cutoff_sqr)
 {
+	// non_cache only adds receptor atoms with r2 < cutoff_sqr from the
+	// (box-clamped) ligand atom; szv_grid's restriction to atoms near the box
+	// is an optimization.  Cells over the whole receptor, holding the atoms
+	// within the cutoff of their brick in receptor order, therefore give the
+	// same terms in the same order for any box.
 	FlatReceptor r;
-	szv relevant;
-	relevant_atoms(m, m.grid_atoms, gd, cutoff_sqr, relevant);
-	add_relevant(m.grid_atoms, relevant, r);
-	local_dims(gd, r.offset, r.dims);
-	// szv_grid_cache::get bricks: [floor(c/3)*3, ceil(c/3)*3]; for any
-	// coordinate not exactly on a cell boundary this is the full cell
+	szv atoms;
+	VINA_FOR_IN(i, m.grid_atoms)
+	{
+		const atom& a = m.grid_atoms[i];
+		if (a.acceptable_type() && !a.is_hydrogen())
+			atoms.push_back(i);
+	}
+	add_relevant(m.grid_atoms, atoms, r);
+	const double cutoff = std::sqrt(cutoff_sqr);
+	vec lo(max_fl, max_fl, max_fl), hi(-max_fl, -max_fl, -max_fl);
+	VINA_FOR_IN(k, atoms)
+		VINA_FOR(d, 3)
+		{
+			lo[d] = std::min(lo[d], m.grid_atoms[atoms[k]].coords[d]);
+			hi[d] = std::max(hi[d], m.grid_atoms[atoms[k]].coords[d]);
+		}
 	std::vector<double> lower[3], upper[3];
 	for (int d = 0; d < 3; d++)
+	{
+		if (atoms.empty())
+			lo[d] = hi[d] = 0;
+		r.offset[d] = int(std::floor((lo[d] - cutoff) / 3.0));
+		r.dims[d] = int(std::ceil((hi[d] + cutoff) / 3.0)) - r.offset[d] + 1;
 		for (int i = 0; i < r.dims[d]; i++)
 		{
 			lower[d].push_back((r.offset[d] + i) * 3.0);
 			upper[d].push_back((r.offset[d] + i + 1) * 3.0);
 		}
-	build_cells(m.grid_atoms, relevant, cutoff_sqr, lower, upper, r);
+	}
+	build_cells(m.grid_atoms, atoms, cutoff_sqr, lower, upper, r);
 	return r;
 }
 

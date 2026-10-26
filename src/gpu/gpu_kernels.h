@@ -70,14 +70,17 @@ bool run_bfgs(const DeviceModels<T>& models, const DeviceTables<T>& tables,
 // cap): bfgs with increasing slope until in the box.  Energies of poses that
 // never got inside are the precision's max; coords receives the final heavy
 // atom coordinates.
-// maxiters, if not empty, gives each conf its own iteration limit.
+// maxiters, if not empty, gives each conf its own iteration limit and boxes,
+// if not empty, its own non_cache box (otherwise ic.box).
 template<typename T>
 bool run_refine(const DeviceModels<T>& models, const DeviceTables<T>& tables,
 		const InterContext<T>& ic, const MinParams& params, const double cap[3],
 		const std::vector<int>& model_of, std::vector<std::vector<double> >& confs,
 		std::vector<double>& e, std::vector<std::vector<double> >& coords,
 		int threads_per_chain = 32,
-		const std::vector<unsigned>& maxiters = std::vector<unsigned>());
+		const std::vector<unsigned>& maxiters = std::vector<unsigned>(),
+		const std::vector<FlatGridGeometry>& boxes =
+				std::vector<FlatGridGeometry>());
 
 } // namespace gpusmina
 

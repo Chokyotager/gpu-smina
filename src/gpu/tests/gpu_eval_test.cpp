@@ -13,6 +13,8 @@
 #include <cstring>
 #include <iomanip>
 #include <type_traits>
+#include <fstream>
+#include <boost/algorithm/string.hpp>
 #include "test_common.h"
 #include "cache.h"
 #include "non_cache.h"
@@ -178,10 +180,10 @@ bool run_precision(const char* label, double tol, model& m,
 	dmodels.upload(fms);
 	DeviceTables<T> dtables;
 	dtables.upload(ft);
-	FlatReceptor fr = gpu_model_flattener::flatten_receptor(m, gd,
+	FlatReceptor fr = gpu_model_flattener::flatten_receptor(m,
 			prec.cutoff_sqr());
 	DeviceReceptor<T> drec;
-	drec.upload(fr, geo);
+	drec.upload(fr);
 	DeviceUserGrid<T> dug;
 	dug.upload(fug);
 
@@ -194,7 +196,7 @@ bool run_precision(const char* label, double tol, model& m,
 	if (!std::is_same<T, double>::value)
 	{
 		const double c2 = prec.cutoff_sqr(), tol2 = 2e-4;
-		FlatReceptor fr0 = gpu_model_flattener::flatten_receptor(m, gd, c2);
+		FlatReceptor fr0 = gpu_model_flattener::flatten_receptor(m, c2);
 		for (size_t i = 0; i < confs.size(); i++)
 		{
 			m.set(confs[i]);
@@ -249,6 +251,7 @@ bool run_precision(const char* label, double tol, model& m,
 				ic.use_cache = backend == 0;
 				ic.grids = dgrids.dev;
 				ic.rec = drec.dev;
+				ic.box = make_box<T>(geo);
 				ic.ug = dug.dev;
 				ic.slope = T(slope);
 				std::vector<double> ge, gg;
@@ -323,7 +326,7 @@ int main(int argc, char* argv[])
 		return 2;
 	}
 	std::string recname = argv[1], ligname = argv[2];
-	std::string scoring, custom, approx = "linear", flexres;
+	std::string scoring, custom, approx = "linear", flexres, user_grid_file;
 	double factor = 32;
 	int nconf = 400;
 	int seed = 7;
@@ -340,6 +343,8 @@ int main(int argc, char* argv[])
 			factor = atof(argv[i + 1]);
 		else if (o == "--flexres")
 			flexres = argv[i + 1];
+		else if (o == "--user_grid")
+			user_grid_file = argv[i + 1];
 		else if (o == "--nconf")
 			nconf = atoi(argv[i + 1]);
 		else if (o == "--seed")
@@ -372,6 +377,37 @@ int main(int argc, char* argv[])
 
 	grid_dims gd = gputest::ligand_box(m, 4);
 	grid user_grid;
+	if (user_grid_file.size())
+	{
+		// main.cpp setup_user_gd + grid::init
+		std::ifstream uin(user_grid_file.c_str());
+		std::string line;
+		std::vector<std::string> tok;
+		for (int k = 0; k < 3; k++)
+			std::getline(uin, line);
+		std::getline(uin, line);
+		boost::algorithm::split(tok, line, boost::algorithm::is_space());
+		const fl granularity = ::atof(tok[1].c_str());
+		std::getline(uin, line);
+		boost::algorithm::split(tok, line, boost::algorithm::is_space());
+		vec span((::atof(tok[1].c_str()) + 1) * granularity,
+				(::atof(tok[2].c_str()) + 1) * granularity,
+				(::atof(tok[3].c_str()) + 1) * granularity);
+		std::getline(uin, line);
+		boost::algorithm::split(tok, line, boost::algorithm::is_space());
+		vec center(::atof(tok[1].c_str()) + 0.5 * granularity,
+				::atof(tok[2].c_str()) + 0.5 * granularity,
+				::atof(tok[3].c_str()) + 0.5 * granularity);
+		grid_dims ugd;
+		VINA_FOR_IN(i, ugd)
+		{
+			ugd[i].n = sz(std::ceil(span[i] / granularity));
+			fl real_span = granularity * ugd[i].n;
+			ugd[i].begin = center[i] - real_span / 2;
+			ugd[i].end = ugd[i].begin + real_span;
+		}
+		user_grid.init(ugd, uin, 1.0);
+	}
 
 	std::cout << "atoms " << m.num_movable_atoms() << "  dof "
 			<< m.get_size().num_degrees_of_freedom() << "  flex " << m.num_flex()

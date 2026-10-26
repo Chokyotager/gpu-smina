@@ -208,6 +208,48 @@ output_container remove_redundant(const output_container& in, fl min_rmsd)
 	return tmp;
 }
 
+//the end of a local search (--local_only, --minimize): score the refined
+//pose as exactly as possible, log and collect the result
+void finish_local(model& m, const weighted_terms& sf, non_cache& nc,
+		const user_settings& settings, bool compute_atominfo, tee& log,
+		grid& user_grid, std::vector<result_info>& results, output_type& out,
+		const vecv& origcoords, const vec& authentic_v)
+{
+	precalculate_exact exact_prec(sf);
+	fl e = 0, rmsd = 0;
+	//be as exact as possible for final score
+	naive_non_cache nnc(&exact_prec); // for out of grid issues
+
+	fl intramolecular_energy = m.eval_intramolecular(exact_prec,
+			authentic_v,
+			out.c);
+	e = m.eval_adjusted(sf, exact_prec, nnc, authentic_v, out.c,
+			intramolecular_energy, user_grid);
+
+	vecv newcoords = m.get_heavy_atom_movable_coords();
+	assert(newcoords.size() == origcoords.size());
+	for (unsigned i = 0, n = newcoords.size(); i < n; i++)
+	{
+		rmsd += (newcoords[i] - origcoords[i]).norm_sqr();
+	}
+	rmsd /= newcoords.size();
+	rmsd = sqrt(rmsd);
+	log << "Affinity: " << std::fixed << std::setprecision(5) << e << "  "
+			<< intramolecular_energy
+			<< " (kcal/mol)\nRMSD: " << rmsd;
+	;
+	log.endl();
+	if (!nc.within(m))
+		log
+		<< "WARNING: not all movable atoms are within the search space\n";
+
+	m.set(out.c);
+	done(settings.verbosity, log);
+	results.push_back(result_info(e, rmsd, m));
+	if (compute_atominfo)
+		results.back().setAtomValues(m, &sf);
+}
+
 //the end of the docking search: rescore the refined poses with the
 //full scoring function, remove redundant poses, log and collect results
 void finish_docking(model& m, const boost::optional<model>& ref,
@@ -357,37 +399,8 @@ void do_search(model& m, const boost::optional<model>& ref,
 				user_grid);
 		done(settings.verbosity, log);
 
-		//be as exact as possible for final score
-		naive_non_cache nnc(&exact_prec); // for out of grid issues
-
-		fl intramolecular_energy = m.eval_intramolecular(exact_prec,
-				authentic_v,
-				out.c);
-		e = m.eval_adjusted(sf, exact_prec, nnc, authentic_v, out.c,
-				intramolecular_energy, user_grid);
-
-		vecv newcoords = m.get_heavy_atom_movable_coords();
-		assert(newcoords.size() == origcoords.size());
-		for (unsigned i = 0, n = newcoords.size(); i < n; i++)
-		{
-			rmsd += (newcoords[i] - origcoords[i]).norm_sqr();
-		}
-		rmsd /= newcoords.size();
-		rmsd = sqrt(rmsd);
-		log << "Affinity: " << std::fixed << std::setprecision(5) << e << "  "
-				<< intramolecular_energy
-				<< " (kcal/mol)\nRMSD: " << rmsd;
-		;
-		log.endl();
-		if (!nc.within(m))
-			log
-			<< "WARNING: not all movable atoms are within the search space\n";
-
-		m.set(out.c);
-		done(settings.verbosity, log);
-		results.push_back(result_info(e, rmsd, m));
-		if (compute_atominfo)
-			results.back().setAtomValues(m, &sf);
+		finish_local(m, sf, nc, settings, compute_atominfo, log, user_grid,
+				results, out, origcoords, authentic_v);
 	}
 	else
 	{
@@ -1464,6 +1477,78 @@ Thank you!\n";
 					std::cout << "Refine time "
 							<< gpu_time + ftime.elapsed().wall / 1e9 << "\n";
 					write_results(results);
+					delete batch[k];
+				}
+				batch.clear();
+			};
+
+			for (unsigned l = 0, nl = ligand_names.size(); l < nl; l++)
+			{
+				doing(settings.verbosity, "Reading input", log);
+				mols.setInputFile(ligand_names[l]);
+				model m;
+				while (no_lig || mols.readMoleculeIntoModel(m))
+				{
+					if (no_lig)
+					{
+						no_lig = false; //only go through loop once
+						m = initm;
+					}
+					done(settings.verbosity, log);
+					batch.push_back(new model(m));
+					if (batch.size() >= per_batch)
+						flush();
+				}
+			}
+			flush();
+			ligand_names.clear(); // done; skip the per-ligand loop below
+		}
+
+		//GPU local optimization of many ligands, each in its own box
+		const bool gpu_local = gpu_engine && settings.local_only
+				&& !settings.score_only && !settings.randomize_only;
+		if (gpu_local)
+		{
+			const sz per_batch = gpu_ligands_per_batch > 0 ? gpu_ligands_per_batch
+					: std::max<sz>(1, gpu_engine->chains_per_batch());
+			const vec authentic_v(settings.forcecap, settings.forcecap,
+					settings.forcecap);
+			const fl slope = 1e6; // main_procedure's non_cache slope
+			const bool compute_atominfo = atomoutfile.is_open()
+					|| settings.include_atom_info;
+			std::vector<model*> batch;
+
+			auto flush = [&]()
+			{
+				if (batch.empty())
+					return;
+				std::vector<gpusmina::GpuDocking::MinimizeJob> jobs(batch.size());
+				std::vector<output_type*> outs;
+				std::vector<vecv> orig(batch.size());
+				VINA_FOR_IN(k, batch)
+				{
+					model& m = *batch[k];
+					parallel_mc par;
+					setup_search(m, settings, minparms, par);
+					jobs[k].m = &m;
+					jobs[k].gd = m.movable_atoms_box(autobox_add, granularity);
+					jobs[k].minparm = par.mc.ssd_par.minparm;
+					outs.push_back(new output_type(m.get_initial_conf(), max_fl));
+					jobs[k].out = outs.back();
+					orig[k] = m.get_heavy_atom_movable_coords();
+				}
+				gpu_engine->minimize_batch(jobs, *prec, authentic_v, user_grid);
+				VINA_FOR_IN(k, batch)
+				{
+					model& m = *batch[k];
+					std::vector<result_info> results;
+					szv_grid_cache gridcache(m, prec->cutoff_sqr());
+					non_cache nc(gridcache, jobs[k].gd, prec.get(), slope);
+					m.set(outs[k]->c);
+					finish_local(m, wt, nc, settings, compute_atominfo, log,
+							user_grid, results, *outs[k], orig[k], authentic_v);
+					write_results(results);
+					delete outs[k];
 					delete batch[k];
 				}
 				batch.clear();

@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include "gpu_defs.h"
 #include "gpu_dev_structs.h"
+#include "gpu_flatten_data.h"
 
 namespace gpusmina
 {
@@ -69,7 +70,7 @@ class DeviceReceptor
 	DevBuf coords, type, charge, cell_start, cell_atoms;
 public:
 	DevReceptor<T> dev;
-	void upload(const FlatReceptor& r, const FlatGridGeometry& box);
+	void upload(const FlatReceptor& r);
 };
 
 template<typename T>
@@ -116,6 +117,20 @@ public:
 };
 
 // per-warp scratch sizing for EvalScratch (in elements of T)
+// a grid_dims as a non_cache box
+template<typename T>
+DevBox<T> make_box(const FlatGridGeometry& g)
+{
+	DevBox<T> b;
+	for (int i = 0; i < 3; i++)
+	{
+		b.begin[i] = T(g.gd_begin[i]);
+		b.end[i] = T(g.gd_end[i]);
+		b.enabled[i] = g.gd_enabled[i];
+	}
+	return b;
+}
+
 ScratchOffsets scratch_layout(int max_movable, int max_frames, int max_list,
 		int max_pairs, bool ordered);
 

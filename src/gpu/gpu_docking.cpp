@@ -110,6 +110,9 @@ struct EngineBase
 			const grid_dims& gd, std::vector<output_type*>& poses,
 			const vec& cap, const minimization_params& minparm,
 			const grid& user_grid, int tpc) = 0;
+	virtual void minimize_batch(GpuDocking::MinimizeJob* jobs, size_t njobs,
+			const precalculate& p, const vec& cap, const grid& user_grid,
+			int tpc) = 0;
 	virtual void dock_batch(GpuDocking::DockJob* const* jobs, size_t njobs,
 			const precalculate& p, const grid_dims& gd, const vec& corner1,
 			const vec& corner2, int seed, const grid& user_grid,
@@ -136,9 +139,10 @@ struct Engine: public EngineBase
 	FlatTables flat_tables;
 	DeviceTables<T> tables;
 
+	bool have_receptor;
+	DeviceReceptor<T> receptor; // non_cache, any box
 	bool have_box;
 	grid_dims box;
-	DeviceReceptor<T> receptor; // non_cache
 	FlatGridGeometry geometry;
 	DeviceGrids<T>* grids; // cache, for `box`
 	double grids_slope;
@@ -148,8 +152,8 @@ struct Engine: public EngineBase
 	DeviceUserGrid<T> user_grid;
 
 	explicit Engine(int d) :
-			EngineBase(d), tables_key(0), have_box(false), grids(0),
-					grids_slope(0), user_grid_key(0)
+			EngineBase(d), tables_key(0), have_receptor(false), have_box(false),
+					grids(0), grids_slope(0), user_grid_key(0)
 	{
 	}
 	~Engine()
@@ -179,15 +183,23 @@ struct Engine: public EngineBase
 		grids = 0;
 	}
 
-	// receptor atoms and cell lists for the box (the receptor is the same
-	// for every ligand of a run)
+	// receptor atoms and cell lists (the receptor is the same for every
+	// ligand of a run)
+	void ensure_receptor(const model& m, double cutoff_sqr)
+	{
+		if (have_receptor)
+			return;
+		receptor.upload(gpu_model_flattener::flatten_receptor(m, cutoff_sqr));
+		have_receptor = true;
+	}
+
+	// the docking box (grids are built for it)
 	void ensure_box(const model& m, const grid_dims& gd, double cutoff_sqr)
 	{
+		ensure_receptor(m, cutoff_sqr);
 		if (have_box && same_box(box, gd))
 			return;
-		FlatReceptor r = gpu_model_flattener::flatten_receptor(m, gd, cutoff_sqr);
 		geometry = gpu_model_flattener::grid_geometry(gd);
-		receptor.upload(r, geometry);
 		box = gd;
 		have_box = true;
 		delete grids;
@@ -222,6 +234,7 @@ struct Engine: public EngineBase
 		else
 			std::memset(&ic.grids, 0, sizeof(ic.grids));
 		ic.rec = receptor.dev;
+		ic.box = make_box<T>(geometry);
 		ic.ug = user_grid.dev;
 		ic.slope = T(slope);
 		return ic;
@@ -296,6 +309,55 @@ struct Engine: public EngineBase
 			const precalculate& p, const grid_dims& gd, const vec& corner1,
 			const vec& corner2, int seed, const grid& ug, double cache_slope,
 			const vec& cap, unsigned* progress, int tpc);
+
+	void minimize_batch(GpuDocking::MinimizeJob* jobs, size_t njobs,
+			const precalculate& p, const vec& cap, const grid& ug, int tpc)
+	{
+		if (njobs == 0)
+			return;
+		cuda_check(cudaSetDevice(device), "cudaSetDevice");
+		ensure_tables(p);
+		ensure_user_grid(ug);
+		ensure_receptor(*jobs[0].m, p.cutoff_sqr());
+		std::vector<FlatModel> fms(njobs);
+		std::vector<const FlatModel*> fmp(njobs);
+		std::vector<std::vector<double> > confs(njobs);
+		std::vector<int> model_of(njobs);
+		std::vector<unsigned> maxiters(njobs);
+		std::vector<FlatGridGeometry> boxes(njobs);
+		for (size_t j = 0; j < njobs; j++)
+		{
+			fms[j] = gpu_model_flattener::flatten_model(*jobs[j].m);
+			fmp[j] = &fms[j];
+			confs[j].resize(fms[j].conf_size);
+			conf_to_flat(jobs[j].out->c, fms[j], &confs[j][0]);
+			model_of[j] = int(j);
+			maxiters[j] = jobs[j].minparm.maxiters;
+			boxes[j] = gpu_model_flattener::grid_geometry(jobs[j].gd);
+		}
+		DeviceModels<T> models;
+		models.upload(fmp);
+		std::vector<double> e;
+		std::vector<std::vector<double> > coords;
+		const double v[3] = {cap[0], cap[1], cap[2]};
+		bool ok = run_refine(models, tables, context(false, 0),
+				min_params(jobs[0].minparm), v, model_of, confs, e, coords,
+				choose_tpc(tpc, njobs), maxiters, boxes);
+		if (!ok)
+			throw std::runtime_error(
+					"Ligand atom exactly overlaps receptor atom.  I can't deal with this.");
+		const double maxT = std::is_same<T, float>::value ? FLT_MAX : DBL_MAX;
+		for (size_t j = 0; j < njobs; j++)
+		{
+			output_type& o = *jobs[j].out;
+			flat_to_conf(&confs[j][0], fms[j], o.c);
+			o.e = (e[j] >= maxT) ? max_fl : e[j];
+			o.coords.clear();
+			for (size_t a = 0; a + 2 < coords[j].size(); a += 3)
+				o.coords.push_back(vec(coords[j][a], coords[j][a + 1],
+						coords[j][a + 2]));
+		}
+	}
 
 	void refine(const model& m, const precalculate& p, const grid_dims& gd,
 			std::vector<output_type*>& poses, const vec& cap,
@@ -478,6 +540,9 @@ GpuDocking::~GpuDocking()
 {
 	for (size_t i = 0; i < engines.size(); i++)
 		delete engines[i];
+	for (size_t i = 0; i < local_engines.size(); i++)
+		if (!settings.fp64) // shared with `engines` in double precision runs
+			delete local_engines[i];
 }
 
 void GpuDocking::parallel_mc(const ::parallel_mc& par, const model& m,
@@ -495,6 +560,60 @@ void GpuDocking::refine(const model& m, const precalculate& p,
 {
 	engines[0]->refine(m, p, gd, poses, cap, minparm, user_grid,
 			settings.threads_per_chain);
+}
+
+void GpuDocking::minimize_batch(std::vector<MinimizeJob>& jobs,
+		const precalculate& p, const vec& cap, const grid& user_grid)
+{
+	if (jobs.empty())
+		return;
+	if (local_engines.empty())
+	{
+		if (settings.fp64)
+			local_engines = engines;
+		else
+			for (size_t i = 0; i < settings.devices.size(); i++)
+				local_engines.push_back(new Engine<double>(settings.devices[i]));
+	}
+	const std::vector<EngineBase*>& engines = local_engines;
+	const size_t nd = engines.size();
+	size_t total_cap = 0;
+	for (size_t d = 0; d < nd; d++)
+		total_cap += engines[d]->capacity();
+	std::vector<size_t> start(nd + 1, 0);
+	size_t acc = 0;
+	for (size_t d = 0; d < nd; d++)
+	{
+		start[d] = jobs.size() * acc / total_cap;
+		acc += engines[d]->capacity();
+	}
+	start[nd] = jobs.size();
+	std::vector<std::string> errors(nd);
+	boost::thread_group threads;
+	for (size_t d = 0; d < nd; d++)
+	{
+		if (start[d] == start[d + 1])
+			continue;
+		EngineBase* e = engines[d];
+		MinimizeJob* first = &jobs[start[d]];
+		const size_t n = start[d + 1] - start[d];
+		std::string* err = &errors[d];
+		const int tpc = settings.threads_per_chain;
+		threads.create_thread([=, &p, &cap, &user_grid]()
+		{
+			try
+			{
+				e->minimize_batch(first, n, p, cap, user_grid, tpc);
+			} catch (std::exception& ex)
+			{
+				*err = ex.what();
+			}
+		});
+	}
+	threads.join_all();
+	for (size_t d = 0; d < nd; d++)
+		if (!errors[d].empty())
+			throw std::runtime_error(errors[d]);
 }
 
 size_t GpuDocking::chains_per_batch() const

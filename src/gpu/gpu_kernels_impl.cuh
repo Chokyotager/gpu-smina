@@ -269,7 +269,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, MinBlocks<TPC>::value) eval_con
 	const ModelView<T>& mv = *mvp;
 	const T v[3] = {v0, v1, v2};
 	T* g = out_g + size_t(c) * mv.d.change_size;
-	T e = eval_deriv<T, Ordered<T>::value>(mv, tb, ic, v, ic.slope,
+	T e = eval_deriv<T, Ordered<T>::value>(mv, tb, ic, v, ic.slope, ic.box,
 			confs + size_t(c) * mv.d.conf_size, g, gd->ws, G);
 	if (G.rank == 0)
 		out_e[c] = e;
@@ -570,7 +570,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, MinBlocks<TPC>::value) bfgs_ker
 		int* chain_imem, const __grid_constant__ ChainOffsets co,
 		const __grid_constant__ GlobalScratch<T> gs,
 		const __grid_constant__ ScratchOffsets so, int* error, T* out_e,
-		int refine, T* out_coords, int max_heavy, const unsigned* item_maxiters)
+		int refine, T* out_coords, int max_heavy, const unsigned* item_maxiters,
+		const DevBox<T>* item_box)
 {
 	Group<TPC> G;
 	int c;
@@ -586,13 +587,14 @@ __global__ void __launch_bounds__(BLOCK_THREADS, MinBlocks<TPC>::value) bfgs_ker
 	MinParams p = prm;
 	if (item_maxiters)
 		p.maxiters = item_maxiters[c];
+	const DevBox<T> box = item_box ? item_box[c] : ic.box;
 	T e;
 	if (refine)
-		e = refine_structure<T, Ordered<T>::value>(mv, tb, ic, v, gd->cv.tmp,
-				gd->cv.work, p, gd->ws, gd->cv.coords, G);
+		e = refine_structure<T, Ordered<T>::value>(mv, tb, ic, box, v,
+				gd->cv.tmp, gd->cv.work, p, gd->ws, gd->cv.coords, G);
 	else
 	{
-		const Objective<T> f(mv, tb, ic, v, ic.slope, gd->ws);
+		const Objective<T> f(mv, tb, ic, v, ic.slope, box, gd->ws);
 		e = bfgs<T, Ordered<T>::value>(f, gd->cv.tmp, gd->cv.work, p, G);
 	}
 	if (refine)
@@ -610,7 +612,7 @@ static void launch_bfgs(const DeviceModels<T>& models,
 		const InterContext<T>& ic, const MinParams& params, const double v[3],
 		const ScratchOffsets& so, const ChainOffsets& co, DevBuf& dmem,
 		DevBuf& dimem, DevBuf& derr, DevBuf& de, int refine, DevBuf& dcoords,
-		const unsigned* dmaxiters)
+		const unsigned* dmaxiters, const DevBox<T>* dboxes)
 {
 	std::vector<BlockTask> tasks = make_tasks(model_of, BLOCK_THREADS / TPC);
 	SharedPlan plan = plan_shared<T, TPC>((const void*) bfgs_kernel<T, TPC>,
@@ -623,7 +625,7 @@ static void launch_bfgs(const DeviceModels<T>& models,
 			models.dev, dtasks.get<BlockTask>(), plan, tables.dev, ic, params,
 			T(v[0]), T(v[1]), T(v[2]), dmem.get<T>(), dimem.get<int>(), co, gs, so,
 			derr.get<int>(), de.get<T>(), refine, dcoords.get<T>(),
-			models.max_heavy, dmaxiters);
+			models.max_heavy, dmaxiters, dboxes);
 	cuda_check(cudaGetLastError(), "bfgs_kernel launch");
 	cuda_check(cudaDeviceSynchronize(), "bfgs_kernel");
 }
@@ -635,7 +637,8 @@ static bool run_minimizer(const DeviceModels<T>& models,
 		const std::vector<int>& model_of, std::vector<std::vector<double> >& confs,
 		std::vector<double>& e, int threads_per_chain, int refine,
 		std::vector<std::vector<double> >* coords,
-		const std::vector<unsigned>& maxiters)
+		const std::vector<unsigned>& maxiters,
+		const std::vector<FlatGridGeometry>& boxes)
 {
 	const int n = int(confs.size());
 	e.assign(n, 0);
@@ -654,6 +657,16 @@ static bool run_minimizer(const DeviceModels<T>& models,
 		dmaxiters.upload(&maxiters[0], sizeof(unsigned) * n);
 	const unsigned* pmax = maxiters.empty() ? (const unsigned*) 0
 			: dmaxiters.get<unsigned>();
+	DevBuf dboxes;
+	if (!boxes.empty())
+	{
+		std::vector<DevBox<T> > b;
+		for (int c = 0; c < n; c++)
+			b.push_back(make_box<T>(boxes[c]));
+		dboxes.upload(&b[0], sizeof(DevBox<T>) * n);
+	}
+	const DevBox<T>* pbox = boxes.empty() ? (const DevBox<T>*) 0
+			: dboxes.get<DevBox<T> >();
 	dmem.upload(&mem[0], sizeof(T) * mem.size());
 	dimem.alloc(sizeof(int) * size_t(n) * co.int_total);
 	de.alloc(sizeof(T) * n);
@@ -663,13 +676,13 @@ static bool run_minimizer(const DeviceModels<T>& models,
 	derr.upload(&zero, sizeof(int));
 	if (threads_per_chain >= 128)
 		launch_bfgs<T, 128>(models, model_of, tables, ic, params, v, so, co, dmem,
-				dimem, derr, de, refine, dcoords, pmax);
+				dimem, derr, de, refine, dcoords, pmax, pbox);
 	else if (threads_per_chain >= 64)
 		launch_bfgs<T, 64>(models, model_of, tables, ic, params, v, so, co, dmem,
-				dimem, derr, de, refine, dcoords, pmax);
+				dimem, derr, de, refine, dcoords, pmax, pbox);
 	else
 		launch_bfgs<T, 32>(models, model_of, tables, ic, params, v, so, co, dmem,
-				dimem, derr, de, refine, dcoords, pmax);
+				dimem, derr, de, refine, dcoords, pmax, pbox);
 	dmem.download(&mem[0], sizeof(T) * mem.size());
 	std::vector<T> he(n);
 	de.download(&he[0], sizeof(T) * n);
@@ -705,7 +718,7 @@ bool run_bfgs(const DeviceModels<T>& models, const DeviceTables<T>& tables,
 {
 	return run_minimizer(models, tables, ic, params, v, model_of, confs, e,
 			threads_per_chain, 0, (std::vector<std::vector<double> >*) 0,
-			std::vector<unsigned>());
+			std::vector<unsigned>(), std::vector<FlatGridGeometry>());
 }
 
 template<typename T>
@@ -713,10 +726,11 @@ bool run_refine(const DeviceModels<T>& models, const DeviceTables<T>& tables,
 		const InterContext<T>& ic, const MinParams& params, const double cap[3],
 		const std::vector<int>& model_of, std::vector<std::vector<double> >& confs,
 		std::vector<double>& e, std::vector<std::vector<double> >& coords,
-		int threads_per_chain, const std::vector<unsigned>& maxiters)
+		int threads_per_chain, const std::vector<unsigned>& maxiters,
+		const std::vector<FlatGridGeometry>& boxes)
 {
 	return run_minimizer(models, tables, ic, params, cap, model_of, confs, e,
-			threads_per_chain, 1, &coords, maxiters);
+			threads_per_chain, 1, &coords, maxiters, boxes);
 }
 
 template bool eval_confs<GPU_PRECISION>(const DeviceModels<GPU_PRECISION>&,
@@ -737,6 +751,7 @@ template bool run_refine<GPU_PRECISION>(const DeviceModels<GPU_PRECISION>&,
 		const DeviceTables<GPU_PRECISION>&, const InterContext<GPU_PRECISION>&,
 		const MinParams&, const double[3], const std::vector<int>&,
 		std::vector<std::vector<double> >&, std::vector<double>&,
-		std::vector<std::vector<double> >&, int, const std::vector<unsigned>&);
+		std::vector<std::vector<double> >&, int, const std::vector<unsigned>&,
+		const std::vector<FlatGridGeometry>&);
 
 } // namespace gpusmina

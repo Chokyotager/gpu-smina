@@ -545,8 +545,8 @@ template<typename T> __device__ T user_grid_eval(const DevUserGrid<T>& ug,
 // CPU's possibilities order
 template<typename T, bool ORDERED, int TPC> __device__ T non_cache_eval_deriv(
 		const ModelView<T>& mv, const DevReceptor<T>& rec,
-		const DevTables<T>& tb, const DevUserGrid<T>& ug, T slope, T v,
-		EvalScratch<T>& ws, const Group<TPC>& G)
+		const DevBox<T>& box, const DevTables<T>& tb, const DevUserGrid<T>& ug,
+		T slope, T v, EvalScratch<T>& ws, const Group<TPC>& G)
 {
 	T* atom_e = ws.pair_buf;
 	T part = 0;
@@ -565,19 +565,19 @@ template<typename T, bool ORDERED, int TPC> __device__ T non_cache_eval_deriv(
 			vec3<T> adj = a_coords;
 			for (int j = 0; j < 3; j++)
 			{
-				if (rec.gd_enabled[j])
+				if (box.enabled[j])
 				{
-					if (a_coords[j] < rec.gd_begin[j])
+					if (a_coords[j] < box.begin[j])
 					{
-						adj[j] = rec.gd_begin[j];
+						adj[j] = box.begin[j];
 						oob_deriv[j] = -1;
-						oob_penalty += gabs(a_coords[j] - rec.gd_begin[j]);
+						oob_penalty += gabs(a_coords[j] - box.begin[j]);
 					}
-					else if (a_coords[j] > rec.gd_end[j])
+					else if (a_coords[j] > box.end[j])
 					{
-						adj[j] = rec.gd_end[j];
+						adj[j] = box.end[j];
 						oob_deriv[j] = 1;
-						oob_penalty += gabs(a_coords[j] - rec.gd_end[j]);
+						oob_penalty += gabs(a_coords[j] - box.end[j]);
 					}
 				}
 			}
@@ -830,8 +830,8 @@ __device__ unsigned long long g_prof[PROF_COUNT];
 // model::eval_deriv; v = {intra-ligand, intermolecular, other pairs}
 template<typename T, bool ORDERED, int TPC> __device__ T eval_deriv(
 		const ModelView<T>& mv, const DevTables<T>& tb,
-		const InterContext<T>& ic, const T v[3], T slope, const T* conf, T* g,
-		EvalScratch<T>& ws, const Group<TPC>& G)
+		const InterContext<T>& ic, const T v[3], T slope, const DevBox<T>& box,
+		const T* conf, T* g, EvalScratch<T>& ws, const Group<TPC>& G)
 {
 	PROF_START(t0);
 	set_conf(mv, conf, ws, G);
@@ -841,8 +841,8 @@ template<typename T, bool ORDERED, int TPC> __device__ T eval_deriv(
 	if (ic.use_cache)
 		e = cache_eval_deriv<T, ORDERED>(mv, ic.grids, slope, v[1], ws, G);
 	else
-		e = non_cache_eval_deriv<T, ORDERED>(mv, ic.rec, tb, ic.ug, slope, v[1],
-				ws, G);
+		e = non_cache_eval_deriv<T, ORDERED>(mv, ic.rec, box, tb, ic.ug, slope,
+				v[1], ws, G);
 	G.sync();
 	PROF_ADD(PROF_INTER, t1);
 	PROF_START(t2);
