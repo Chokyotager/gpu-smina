@@ -320,7 +320,10 @@ bool eval_confs(const DeviceModels<T>& models, int model,
 	int zero = 0;
 	derr.upload(&zero, sizeof(int));
 	DevBuf* pc = coords ? &dcoords : 0;
-	if (threads_per_chain >= 128)
+	if (threads_per_chain >= 256)
+		launch_eval_confs<T, 256>(models, nconf, model, tables, ic, v, so, dconfs,
+				de, dg, pc, derr);
+	else if (threads_per_chain >= 128)
 		launch_eval_confs<T, 128>(models, nconf, model, tables, ic, v, so, dconfs,
 				de, dg, pc, derr);
 	else if (threads_per_chain >= 64)
@@ -522,7 +525,10 @@ void run_monte_carlo(const DeviceModels<T>& models,
 		cuda_check(cudaHostGetDevicePointer((void**) &dprogress, progress, 0),
 				"progress pointer");
 
-	if (threads_per_chain >= 128)
+	if (threads_per_chain >= 256)
+		launch_monte_carlo<T, 256>(models, cmodel, tables, ic, params, so, co,
+				drng, dmem, dimem, derr, dprogress, dlimits, cost);
+	else if (threads_per_chain >= 128)
 		launch_monte_carlo<T, 128>(models, cmodel, tables, ic, params, so, co,
 				drng, dmem, dimem, derr, dprogress, dlimits, cost);
 	else if (threads_per_chain >= 64)
@@ -674,7 +680,10 @@ static bool run_minimizer(const DeviceModels<T>& models,
 		dcoords.alloc(sizeof(T) * size_t(n) * 3 * models.max_heavy);
 	int zero = 0;
 	derr.upload(&zero, sizeof(int));
-	if (threads_per_chain >= 128)
+	if (threads_per_chain >= 256)
+		launch_bfgs<T, 256>(models, model_of, tables, ic, params, v, so, co, dmem,
+				dimem, derr, de, refine, dcoords, pmax, pbox);
+	else if (threads_per_chain >= 128)
 		launch_bfgs<T, 128>(models, model_of, tables, ic, params, v, so, co, dmem,
 				dimem, derr, de, refine, dcoords, pmax, pbox);
 	else if (threads_per_chain >= 64)

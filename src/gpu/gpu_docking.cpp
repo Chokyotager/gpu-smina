@@ -92,12 +92,16 @@ struct EngineBase
 	{
 		cudaDeviceProp prop;
 		cuda_check(cudaSetDevice(device), "cudaSetDevice");
+		// block (rather than spin) while waiting for the GPU so the host
+		// threads that parse and finish ligands keep their CPU; harmless if
+		// another engine already set the flags on this device
+		cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync | cudaDeviceMapHost);
+		cudaGetLastError();
 		cuda_check(cudaGetDeviceProperties(&prop, device),
 				"cudaGetDeviceProperties");
 		if (prop.computeMode == cudaComputeModeProhibited)
 			throw std::runtime_error("GPU device is in compute mode prohibited");
 		sm_count = prop.multiProcessorCount;
-		cudaSetDeviceFlags(cudaDeviceMapHost);
 	}
 	virtual ~EngineBase()
 	{
@@ -123,12 +127,19 @@ struct EngineBase
 		return size_t(sm_count) * 3 * 8;
 	}
 
-	// few chains: use more threads per chain to lower latency
+	// While every item fits on the GPU at once, a launch takes as long as
+	// its slowest item, so use the most threads per item that keeps them all
+	// resident; beyond that, 32 threads per item give the best throughput.
 	int choose_tpc(int requested, size_t items) const
 	{
 		if (requested > 0)
 			return requested;
-		return (items < size_t(4 * sm_count)) ? 128 : 32;
+		const size_t resident_threads = size_t(sm_count) * 768;
+		const int options[3] = {256, 128, 64};
+		for (int i = 0; i < 3; i++)
+			if (items * options[i] <= resident_threads)
+				return options[i];
+		return 32;
 	}
 };
 

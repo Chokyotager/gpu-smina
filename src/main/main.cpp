@@ -1026,7 +1026,7 @@ Thank you!\n";
         "Enable torsions effecting only hydrogens (e.g. OH groups). This is stupid but provides compatibility with Vina.")
 #ifdef SMINA_GPU
 		("gpu_threads", value<int>(&gpu_threads)->default_value(0),
-				"GPU threads per search chain (32, 64 or 128; 0 chooses automatically)")
+				"GPU threads per search chain (32, 64, 128 or 256; 0 chooses automatically)")
 		("gpu_fp64", bool_switch(&gpu_fp64),
 				"Use double precision GPU kernels (for validation; slow on consumer GPUs)")
 		("gpu_batch", value<int>(&gpu_ligands_per_batch)->default_value(0),
