@@ -46,6 +46,7 @@ private:
 	grid_dims gd;
 	fl slope; // does not get (de-)serialized
 	std::vector<grid> grids;
+	friend struct gpu_model_flattener;
 	friend class boost::serialization::access;
 	template<class Archive>
 	void save(Archive& ar, const unsigned version) const;

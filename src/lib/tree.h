@@ -136,6 +136,7 @@ struct axis_frame : public atom_frame {
 	void set_derivative(const vecp& force_torque, fl& c) const {
 		c = force_torque.second * axis;
 	}
+	const vec& get_axis() const { return axis; }
 protected:
 	vec axis;
 
@@ -169,6 +170,8 @@ struct segment : public axis_frame {
 	void count_torsions(sz& s) const {
 		++s;
 	}
+	const vec& get_relative_axis() const { return relative_axis; }
+	const vec& get_relative_origin() const { return relative_origin; }
 private:
 	vec relative_axis;
 	vec relative_origin;

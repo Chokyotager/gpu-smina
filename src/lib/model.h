@@ -344,6 +344,7 @@ private:
 	friend struct appender_info;
 	friend struct pdbqt_initializer;
 	friend struct model_test;
+	friend struct gpu_model_flattener;
 
 	const atom& get_atom(const atom_index& i) const { return (i.in_grid ? grid_atoms[i.i] : atoms[i.i]); }
 	      atom& get_atom(const atom_index& i)       { return (i.in_grid ? grid_atoms[i.i] : atoms[i.i]); }

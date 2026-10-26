@@ -32,6 +32,7 @@
 //base class for precaluting classes
 class precalculate
 {
+	friend struct gpu_model_flattener;
 public:
 	//return just the fast evaluation of types, no derivative
 	virtual result_components eval_fast(smt t1, smt t2, fl r2) const = 0;
@@ -91,6 +92,7 @@ typedef std::vector<prv> prvv; //index by component, then point
 class precalculate_linear_element
 {
 	friend class precalculate_linear;
+	friend struct gpu_model_flattener;
 	precalculate_linear_element(sz n, sz num_components, fl factor_) :
 			fast(n, flv(num_components, 0)),
 					smooth(num_components, prv(n, pr(0, 0))), //index by control point then by component
@@ -184,6 +186,7 @@ class precalculate_linear_element
 
 class precalculate_linear: public precalculate
 {
+	friend struct gpu_model_flattener;
 	//evaluate data while properly swapping types
 	result_components eval_fast_data(smt t1, smt t2, fl r2) const
 	{
@@ -309,6 +312,7 @@ typedef std::pair<result_components, result_components> component_pair;
 //will decompose charge dependent terms
 class spline_cache
 {
+	friend struct gpu_model_flattener;
 	const scoring_function* sf;
 	fl cutoff;
 	sz n;
@@ -425,6 +429,7 @@ public:
 // smooth gradients
 class precalculate_splines: public precalculate
 {
+	friend struct gpu_model_flattener;
 	//evaluates splines at t1/t2 and r, properly swaping result
 	component_pair evaldata(smt t1, smt t2, fl r) const
 			{
