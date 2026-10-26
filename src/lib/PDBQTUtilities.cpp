@@ -151,8 +151,13 @@ bool IsRotBond_PDBQT(OBBond * the_bond, unsigned desired_root)
 	{
 		return false;
 	}
+#if OB_VERSION >= OB_VERSION_CHECK(2, 90, 0)
+	if (((the_bond->GetBeginAtom())->GetHvyDegree() == 1)
+			|| ((the_bond->GetEndAtom())->GetHvyDegree() == 1))
+#else
 	if (((the_bond->GetBeginAtom())->GetHvyValence() == 1)
 			|| ((the_bond->GetEndAtom())->GetHvyValence() == 1))
+#endif
 	{
 		if (the_bond->GetBeginAtomIdx() == desired_root)
 			return true;
@@ -332,7 +337,7 @@ void createSDFContext(OBMol& mol, vector<OBAtom*> atoms, sdfcontext& sc)
 	{
 		unsigned first = idx2atompos[bitr->GetBeginAtomIdx()];
 		unsigned second = idx2atompos[bitr->GetEndAtomIdx()];
-		sc.bonds.push_back(sdfcontext::sdfbond(first, second, bitr->GetBO()));
+		sc.bonds.push_back(sdfcontext::sdfbond(first, second, bitr->GetBondOrder()));
 	}
 }
 

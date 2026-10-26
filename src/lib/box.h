@@ -1,4 +1,8 @@
 #include <openbabel/mol.h>
+#include <openbabel/atom.h>
+#include <openbabel/bond.h>
+#include <openbabel/residue.h>
+#include <openbabel/obiter.h>
 #include <cmath> // for ceila
 #include "common.h"
 

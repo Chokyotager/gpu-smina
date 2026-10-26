@@ -32,6 +32,10 @@ GNU General Public License for more details.
 #define PDBQTUTILITIES_H_
 
 #include <openbabel/mol.h>
+#include <openbabel/atom.h>
+#include <openbabel/bond.h>
+#include <openbabel/residue.h>
+#include <openbabel/obiter.h>
 #include <iostream>
 #include <set>
 #include "parsing.h"

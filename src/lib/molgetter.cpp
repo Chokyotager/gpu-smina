@@ -8,6 +8,10 @@
 #include "parse_pdbqt.h"
 #include "parsing.h"
 #include <openbabel/mol.h>
+#include <openbabel/atom.h>
+#include <openbabel/bond.h>
+#include <openbabel/residue.h>
+#include <openbabel/obiter.h>
 #include <openbabel/obconversion.h>
 #include <boost/archive/binary_iarchive.hpp>
 #include "SminaConverter.h"

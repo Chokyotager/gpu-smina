@@ -29,6 +29,10 @@
 #include "custom_terms.h"
 #include <openbabel/babelconfig.h>
 #include <openbabel/mol.h>
+#include <openbabel/atom.h>
+#include <openbabel/bond.h>
+#include <openbabel/residue.h>
+#include <openbabel/obiter.h>
 #include <openbabel/parsmart.h>
 #include <openbabel/obconversion.h>
 #include <boost/iostreams/stream.hpp>
@@ -840,7 +844,7 @@ int main(int argc, char* argv[])
 {
 	using namespace boost::program_options;
 	const std::string version_string =
-			"Smina "__DATE__".  Based on AutoDock Vina 1.1.2.";
+			"Smina " __DATE__ ".  Based on AutoDock Vina 1.1.2.";
 	const std::string error_message =
 			"\n\n\
 Please report this error at http://smina.sf.net\n"

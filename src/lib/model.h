@@ -24,7 +24,7 @@
 #define VINA_MODEL_H
 
 #include <boost/optional.hpp> // for context
-#include <boost/serialization/optional.hpp>
+#include "optional_serialization.h"
 #include <boost/serialization/utility.hpp>
 #include <string>
 #include "file.h"
