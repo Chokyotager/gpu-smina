@@ -29,30 +29,35 @@
 struct tee {
 	bool quiet;
 	ofile* of;
-	tee(bool q = false) : of(NULL), quiet(q) {}
+	std::ostream* capture; // if set, all output goes here instead
+	tee(bool q = false) : of(NULL), quiet(q), capture(NULL) {}
 	void init(const path& name) {
 		of = new ofile(name);
 	}
 	virtual ~tee() { delete of; }
 	void flush() {
+		if(capture) { (*capture) << std::flush; return; }
 		if(!quiet)
 			std::cout << std::flush;
 		if(of)
 			(*of) << std::flush;
 	}
 	void endl() {
+		if(capture) { (*capture) << std::endl; return; }
 		if(!quiet)
 			std::cout << std::endl;
 		if(of)
 			(*of) << std::endl;
 	}
 	void setf(std::ios::fmtflags a) {
+		if(capture) { capture->setf(a); return; }
 		if(!quiet)
 			std::cout.setf(a);
 		if(of)
 			of->setf(a);
 	}
 	void setf(std::ios::fmtflags a, std::ios::fmtflags b) {
+		if(capture) { capture->setf(a, b); return; }
 		if(!quiet)
 			std::cout.setf(a, b);
 		if(of)
@@ -62,6 +67,7 @@ struct tee {
 
 template<typename T>
 tee& operator<<(tee& out, const T& x) {
+	if(out.capture) { (*out.capture) << x; return out; }
 	if(!out.quiet)
 		std::cout << x;
 	if(out.of)

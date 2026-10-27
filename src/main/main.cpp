@@ -1477,22 +1477,64 @@ Thank you!\n";
 				gpu_engine->dock_batch(jobp, *prec, gd, corner1, corner2,
 						settings.seed, user_grid, slope, authentic_v, true);
 				const double gpu_time = btime.elapsed().wall / 1e9 / batch.size();
-				VINA_FOR_IN(k, batch)
+				// finish the ligands (final scoring, clustering) on settings.cpu
+				// threads, each logging into its own buffer; then log and write
+				// them in input order
+				const sz n = batch.size();
+				std::vector<std::string> texts(n);
+				std::vector<std::vector<result_info> > results(n);
+				std::vector<double> ftimes(n, 0);
+				std::vector<std::string> errors(n);
+				boost::mutex next_lock;
+				sz next = 0;
+				auto finish = [&]()
 				{
-					boost::timer::cpu_timer ftime;
-					model& m = *batch[k];
-					boost::optional<model> ref;
-					std::vector<result_info> results;
-					log << "Using random seed: " << settings.seed;
-					log.endl();
-					szv_grid_cache gridcache(m, prec->cutoff_sqr());
-					non_cache nc(gridcache, gd, prec.get(), slope);
-					finish_docking(m, ref, wt, *prec, nc, settings,
-							compute_atominfo, log, user_grid, results, jobs[k].out,
-							authentic_v);
-					std::cout << "Refine time "
-							<< gpu_time + ftime.elapsed().wall / 1e9 << "\n";
-					write_results(results);
+					for (;;)
+					{
+						sz k;
+						{
+							boost::mutex::scoped_lock l(next_lock);
+							if (next == n)
+								return;
+							k = next++;
+						}
+						try
+						{
+							boost::timer::cpu_timer ftime;
+							std::ostringstream text;
+							text.copyfmt(std::cout); // the log's formatting state
+							tee klog(true);
+							klog.capture = &text;
+							model& m = *batch[k];
+							boost::optional<model> ref;
+							klog << "Using random seed: " << settings.seed;
+							klog.endl();
+							szv_grid_cache gridcache(m, prec->cutoff_sqr());
+							non_cache nc(gridcache, gd, prec.get(), slope);
+							finish_docking(m, ref, wt, *prec, nc, settings,
+									compute_atominfo, klog, user_grid, results[k],
+									jobs[k].out, authentic_v);
+							texts[k] = text.str();
+							ftimes[k] = ftime.elapsed().wall / 1e9;
+						} catch (std::exception& e)
+						{
+							errors[k] = e.what();
+						}
+					}
+				};
+				const int nthreads = std::max(1, std::min<int>(settings.cpu, n));
+				boost::thread_group finishers;
+				for (int t = 1; t < nthreads; t++)
+					finishers.create_thread(finish);
+				finish();
+				finishers.join_all();
+				VINA_FOR(k, n)
+				{
+					if (!errors[k].empty())
+						throw std::runtime_error(errors[k]);
+					log << texts[k];
+					std::cout << "Refine time " << gpu_time + ftimes[k] << "\n";
+					write_results(results[k]);
 					delete batch[k];
 				}
 				batch.clear();
