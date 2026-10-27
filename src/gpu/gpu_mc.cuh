@@ -597,7 +597,7 @@ template<typename T, bool ORDERED, int TPC> __device__ void monte_carlo_chain(
 		const ModelView<T>& mv, const DevTables<T>& tb,
 		const InterContext<T>& ic, const MCParams& prm, const ChainView<T>& cv,
 		EvalScratch<T>& ws, MTState& rng, const Group<TPC>& G, unsigned* progress,
-		unsigned start, T& tmp_e, T& best_e)
+		unsigned start, T& tmp_e, T& best_e, float* trace = 0)
 {
 	const T hunt_cap[3] = {T(prm.hunt_cap[0]), T(prm.hunt_cap[1]),
 			T(prm.hunt_cap[2])};
@@ -616,6 +616,11 @@ template<typename T, bool ORDERED, int TPC> __device__ void monte_carlo_chain(
 	// so steps are reported 32 at a time (per step, thousands of chains
 	// stall on them, and two GPUs updating one counter serialize)
 	unsigned unreported = 0;
+	// trace (GPU_TRACE_STEPS): step of the last improvement of best_e, of the
+	// last one by more than 0.1, and best_e after each tenth of the steps
+	unsigned next_tenth = 0;
+	while (next_tenth < 10 && (next_tenth + 1) * prm.num_steps / 10 <= start)
+		next_tenth++;
 	for (unsigned step = start; step < prm.num_steps; step++)
 	{
 		if (progress && G.rank == 0 && ++unreported == 32)
@@ -650,9 +655,21 @@ template<typename T, bool ORDERED, int TPC> __device__ void monte_carlo_chain(
 						T(prm.min_rmsd), prm.num_saved_mins, G);
 				PROF_ADD(PROF_OUTPUT, to);
 				if (tmp_e < best_e)
+				{
+					if (trace && G.rank == 0)
+					{
+						trace[0] = float(step);
+						if (best_e - tmp_e > T(0.1))
+							trace[1] = float(step);
+					}
 					best_e = tmp_e;
+				}
 			}
 		}
+		if (trace && G.rank == 0)
+			while (next_tenth < 10
+					&& (next_tenth + 1) * prm.num_steps / 10 <= step + 1)
+				trace[2 + next_tenth++] = float(best_e);
 	}
 	if (progress && G.rank == 0 && unreported)
 		atomicAdd(progress, unreported);

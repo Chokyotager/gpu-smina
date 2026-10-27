@@ -6,6 +6,7 @@
 #include <boost/thread/thread.hpp>
 #include <sstream>
 #include <cfloat>
+#include <cmath>
 #include <cstring>
 #include <type_traits>
 
@@ -89,8 +90,9 @@ struct EngineBase
 	int sm_count;
 	Residency mc_res, bfgs_res; // of this engine's kernels
 	int chain_split; // GpuSettings::chain_split
+	double step_fraction; // GpuSettings::step_fraction
 	explicit EngineBase(int d) :
-			device(d), sm_count(1), chain_split(1)
+			device(d), sm_count(1), chain_split(1), step_fraction(1)
 	{
 		cudaDeviceProp prop;
 		cuda_check(cudaSetDevice(device), "cudaSetDevice");
@@ -130,7 +132,8 @@ struct EngineBase
 			int tpc) = 0;
 	// parallel_mc's tasks for a ligand, appended to `chains`: one chain per
 	// task, seeded in order from `generator` (parallel_mc::operator()); with
-	// chain_split n, n chains per task with 1/n of the steps each
+	// chain_split n, n chains per task with 1/n of the steps each; with
+	// step_fraction f, f of the steps
 	void add_chains(std::vector<ChainInput>& chains, const model& m,
 			const FlatModel& fm, int model_index, const ::parallel_mc& par,
 			rng& generator, const vec& corner1, const vec& corner2) const
@@ -140,14 +143,14 @@ struct EngineBase
 		{
 			ChainInput c = make_chain(m, fm, model_index,
 					::random_int(0, 1000000, generator), corner1, corner2);
-			c.num_steps = split_steps(mp.num_steps, chain_split);
+			c.num_steps = chain_steps(mp.num_steps, chain_split, step_fraction);
 			c.maxiters = mp.min.maxiters;
 			chains.push_back(c);
 		}
 	}
-	static unsigned split_steps(unsigned steps, int split)
+	static unsigned chain_steps(unsigned steps, int split, double fraction)
 	{
-		return (steps + split - 1) / split;
+		return std::max(1u, unsigned(std::ceil(steps * fraction / split)));
 	}
 
 	// chains resident at 32 threads each (the throughput configuration)
@@ -308,7 +311,7 @@ struct Engine: public EngineBase
 					cudaHostAllocMapped), "cudaHostAlloc");
 			*counter = 0;
 			poller = new ProgressPoller(counter, (unsigned long) chains.size()
-					* split_steps(par.mc.num_steps, chain_split));
+					* chain_steps(par.mc.num_steps, chain_split, step_fraction));
 		}
 		std::vector<ChainResult> results;
 		try
@@ -567,6 +570,7 @@ GpuDocking::GpuDocking(const GpuSettings& s) :
 		else
 			engines.push_back(new Engine<float>(d));
 		engines.back()->chain_split = std::max(1, settings.chain_split);
+		engines.back()->step_fraction = settings.step_fraction;
 	}
 }
 
@@ -686,7 +690,8 @@ void GpuDocking::dock_batch(std::vector<DockJob*>& jobs, const precalculate& p,
 	const int split = settings.chain_split;
 	for (size_t j = 0; j < jobs.size(); j++)
 		total_steps += (unsigned long) jobs[j]->par.num_tasks * split
-				* EngineBase::split_steps(jobs[j]->par.mc.num_steps, split);
+				* EngineBase::chain_steps(jobs[j]->par.mc.num_steps, split,
+						settings.step_fraction);
 	unsigned* counter = 0;
 	ProgressPoller* poller = 0;
 	if (display_progress)

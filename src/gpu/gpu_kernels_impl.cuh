@@ -428,6 +428,8 @@ static void report_profile()
 #endif
 
 __device__ unsigned long long* g_chain_stats;
+// GPU_TRACE_STEPS diagnostics: 12 values per chain (see monte_carlo_chain)
+__device__ float* g_trace;
 
 template<typename T, int TPC>
 __global__ void __launch_bounds__(BLOCK_THREADS, MinBlocks<TPC>::value) monte_carlo_kernel(
@@ -488,7 +490,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, MinBlocks<TPC>::value) monte_ca
 	p.num_steps = lim.y;
 	p.min.maxiters = lim.z;
 	monte_carlo_chain<T, Ordered<T>::value>(mv, tb, ic, p, gd->cv, gd->ws,
-			rngs[chain], G, progress, lim.x, tmp_e, best_e);
+			rngs[chain], G, progress, lim.x, tmp_e, best_e,
+			g_trace ? g_trace + 12 * size_t(chain) : (float*) 0);
 	if (lim.w)
 	{
 		// more steps follow in a later launch
@@ -661,6 +664,18 @@ void run_monte_carlo(const DeviceModels<T>& models,
 		cudaMemcpyToSymbol(g_group_evals, &pg, sizeof(pg));
 		t0 = 0;
 	}
+	// GPU_TRACE_STEPS=file: per chain, the step of its last improvement (and
+	// of its last one by more than 0.1) and its best energy after each tenth
+	// of its steps, appended to the file
+	const char* trace_path = getenv("GPU_TRACE_STEPS");
+	DevBuf dtrace;
+	if (trace_path)
+	{
+		std::vector<float> init(12 * size_t(nchains), -1.0f);
+		dtrace.upload(&init[0], sizeof(float) * init.size());
+		float* pt = dtrace.get<float>();
+		cudaMemcpyToSymbol(g_trace, &pt, sizeof(pt));
+	}
 	unsigned* dprogress = 0;
 	if (progress)
 		cuda_check(cudaHostGetDevicePointer((void**) &dprogress, progress, 0),
@@ -746,6 +761,25 @@ void run_monte_carlo(const DeviceModels<T>& models,
 		unsigned long long* z = 0;
 		cudaMemcpyToSymbol(g_chain_stats, &z, sizeof(z));
 		cudaMemcpyToSymbol(g_group_evals, &z, sizeof(z));
+	}
+
+	if (trace_path)
+	{
+		std::vector<float> tr(12 * size_t(nchains));
+		dtrace.download(&tr[0], sizeof(float) * tr.size());
+		float* z = 0;
+		cudaMemcpyToSymbol(g_trace, &z, sizeof(z));
+		if (FILE* f = fopen(trace_path, "a"))
+		{
+			for (int c = 0; c < nchains; c++)
+			{
+				fprintf(f, "%d\t%d\t%u", chains[c].model, c, steps[c]);
+				for (int k = 0; k < 12; k++)
+					fprintf(f, "\t%.4f", tr[12 * size_t(c) + k]);
+				fprintf(f, "\n");
+			}
+			fclose(f);
+		}
 	}
 
 	dmem.download(&mem[0], sizeof(T) * mem.size());

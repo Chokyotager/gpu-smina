@@ -28,7 +28,10 @@ struct GpuSettings
 	// GPU-style search (not smina's): every Monte Carlo chain is replaced by
 	// this many chains with 1/chain_split of its steps, run concurrently
 	int chain_split;
-	GpuSettings() : fp64(false), threads_per_chain(0), chain_split(1) {}
+	// fraction of smina's Monte Carlo steps to run (1: smina's search)
+	double step_fraction;
+	GpuSettings() : fp64(false), threads_per_chain(0), chain_split(1),
+			step_fraction(1) {}
 };
 
 // parse "0,1" into device ordinals
