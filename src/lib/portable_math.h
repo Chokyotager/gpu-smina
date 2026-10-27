@@ -1,12 +1,36 @@
 /*
- * Deterministic double precision sin, cos, acos and exp (fdlibm-style range
- * reduction and polynomials) that give bit-identical results on the CPU and
- * on CUDA devices, provided neither side contracts multiply-adds into FMAs.
+ * Deterministic double precision sin, cos, acos and exp that give
+ * bit-identical results on the CPU and on CUDA devices, provided neither side
+ * contracts multiply-adds into FMAs.  The algorithms and coefficients are
+ * those of fdlibm: k_sin.c, k_cos.c and the medium-range reduction of
+ * e_rem_pio2.c (sin, cos), e_acos.c (acos) and e_exp.c (exp).
  *
- * Used by the GPU validation build (double precision kernels) and, when
- * SMINA_PORTABLE_MATH is defined, by the CPU code on the search path, so that
- * CPU and GPU trajectories can be compared bit for bit.  Production smina
- * uses the platform libm.  Accuracy is within about 1 ulp.
+ * Used by the double precision GPU kernels (validation and GPU local
+ * optimization) and, when SMINA_PORTABLE_MATH is defined, by the CPU code on
+ * the search path, so that CPU and GPU trajectories can be compared bit for
+ * bit.  CPU smina otherwise uses the platform libm.  Accuracy is within about
+ * 1 ulp.
+ *
+ * The notices of the fdlibm sources these functions derive from:
+ *
+ * k_sin.c, k_cos.c, e_rem_pio2.c, e_acos.c:
+ * ====================================================
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Developed at SunSoft, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
+ *
+ * e_exp.c:
+ * ====================================================
+ * Copyright (C) 2004 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
  */
 
 #ifndef SMINA_PORTABLE_MATH_H
