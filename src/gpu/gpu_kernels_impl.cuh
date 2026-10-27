@@ -123,6 +123,12 @@ SharedPlan plan_shared(const void* kernel, const DeviceModels<T>& models,
 	p.hot_off = p.model_off + (p.stage_model ? model_bytes : 0);
 	p.pair_off = p.hot_off + (p.hot_shared ? hot : 0);
 	p.total = p.pair_off + (p.pair_shared ? pair : 0);
+#ifdef GPU_PROFILE
+	printf("shared plan: budget %zu, fixed %zu, hot %zu (%s), model %zu (%s),"
+			" pairs %zu (%s)\n", budget, fixed, hot, p.hot_shared ? "shared"
+			: "global", model_bytes, p.stage_model ? "shared" : "global", pair,
+			p.pair_shared ? "shared" : "global");
+#endif
 	if (p.total > 48 * 1024)
 		cuda_check(cudaFuncSetAttribute(kernel,
 				cudaFuncAttributeMaxDynamicSharedMemorySize, int(p.total)),
@@ -404,8 +410,9 @@ static void report_profile()
 {
 	unsigned long long prof[PROF_COUNT];
 	cudaMemcpyFromSymbol(prof, g_prof, sizeof(prof));
-	const char* names[PROF_COUNT] = {"set_conf", "inter", "pairs", "deriv",
-			"eval_total", "bfgs_total", "mutate", "output", "mc_total", "evals"};
+	const char* names[PROF_COUNT] = {"set_conf", " set atoms", " set frames", "inter", "pairs",
+			" pair pass1", " pair pass2", "deriv", "eval_total", "bfgs_total",
+			"mutate", "output", "mc_total", "evals"};
 	double evals = double(prof[PROF_EVALS]);
 	printf("profile (warp 0): %llu evals, %.0f cycles/eval\n", prof[PROF_EVALS],
 			prof[PROF_EVAL_TOTAL] / evals);
@@ -416,6 +423,8 @@ static void report_profile()
 	cudaMemcpyToSymbol(g_prof, zero, sizeof(zero));
 }
 #endif
+
+__device__ unsigned long long* g_chain_stats;
 
 template<typename T, int TPC>
 __global__ void __launch_bounds__(BLOCK_THREADS, MinBlocks<TPC>::value) monte_carlo_kernel(
@@ -447,11 +456,26 @@ __global__ void __launch_bounds__(BLOCK_THREADS, MinBlocks<TPC>::value) monte_ca
 	for (int i = G.rank; i < 3 * mv.d.num_frames; i += TPC)
 		gd->ws.frame_origin[i] = fo0[i];
 	G.sync();
+	if (g_chain_stats && G.rank == 0)
+	{
+		unsigned long long t;
+		asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+		g_chain_stats[4 * chain + 3] = t;
+	}
 	MCParams p = prm;
 	p.num_steps = chain_limits[chain].x;
 	p.min.maxiters = chain_limits[chain].y;
 	monte_carlo_chain<T, Ordered<T>::value>(mv, tb, ic, p, gd->cv, gd->ws,
 			rngs[chain], G, progress);
+	if (g_chain_stats && G.rank == 0)
+	{
+		unsigned long long t;
+		asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+		g_chain_stats[4 * chain] = t;
+		g_chain_stats[4 * chain + 1] =
+				g_group_evals[blockIdx.x * (blockDim.x / TPC) + G.gid];
+		g_chain_stats[4 * chain + 2] = blockIdx.x;
+	}
 }
 
 template<typename T, int TPC>
@@ -522,6 +546,20 @@ void run_monte_carlo(const DeviceModels<T>& models,
 	int zero = 0;
 	derr.upload(&zero, sizeof(int));
 
+	DevBuf dstats, dgroup;
+	const bool chain_stats = getenv("GPU_CHAIN_STATS") != 0;
+	unsigned long long t0 = 0;
+	if (chain_stats)
+	{
+		dstats.alloc(sizeof(unsigned long long) * 4 * nchains);
+		dgroup.alloc(sizeof(unsigned long long) * 8 * nchains + 4096);
+		dgroup.zero();
+		unsigned long long* ps = dstats.get<unsigned long long>();
+		unsigned long long* pg = dgroup.get<unsigned long long>();
+		cudaMemcpyToSymbol(g_chain_stats, &ps, sizeof(ps));
+		cudaMemcpyToSymbol(g_group_evals, &pg, sizeof(pg));
+		t0 = 0;
+	}
 	unsigned* dprogress = 0;
 	if (progress)
 		cuda_check(cudaHostGetDevicePointer((void**) &dprogress, progress, 0),
@@ -542,6 +580,38 @@ void run_monte_carlo(const DeviceModels<T>& models,
 #ifdef GPU_PROFILE
 	report_profile();
 #endif
+	if (chain_stats)
+	{
+		std::vector<unsigned long long> st(4 * nchains);
+		dstats.download(&st[0], sizeof(unsigned long long) * st.size());
+		unsigned long long first = ~0ULL;
+		for (int c = 0; c < nchains; c++)
+			first = std::min(first, st[4 * c]);
+		std::vector<std::pair<unsigned long long, int> > order;
+		for (int c = 0; c < nchains; c++)
+			order.push_back(std::make_pair(st[4 * c], c));
+		std::sort(order.begin(), order.end());
+		fprintf(stderr, "chains by end time (ms after first finished):");
+		for (int i = nchains - 1; i >= 0 && i >= nchains - 8; i--)
+		{
+			const int c = order[i].second;
+			fprintf(stderr, " [chain %d model %d: %.0f ms, %llu evals, block %llu]",
+					c, chains[c].model, (st[4 * c] - first) * 1e-6, st[4 * c + 1],
+					st[4 * c + 2]);
+		}
+		unsigned long long tot = 0;
+		double us = 0;
+		for (int c = 0; c < nchains; c++)
+		{
+			tot += st[4 * c + 1];
+			us += (st[4 * c] - st[4 * c + 3]) * 1e-3 / double(st[4 * c + 1]);
+		}
+		fprintf(stderr, "\nmean evals per chain %.0f, mean %.2f us per eval\n",
+				double(tot) / nchains, us / nchains);
+		unsigned long long* z = 0;
+		cudaMemcpyToSymbol(g_chain_stats, &z, sizeof(z));
+		cudaMemcpyToSymbol(g_group_evals, &z, sizeof(z));
+	}
 
 	dmem.download(&mem[0], sizeof(T) * mem.size());
 	std::vector<int> imem(size_t(nchains) * co.int_total);

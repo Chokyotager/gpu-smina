@@ -414,12 +414,37 @@ template<typename T> __device__ __forceinline__ T grid_evaluate_aux(
 
 ////////////////////////////// conformation //////////////////////////////
 
+// optional section timers (build with -DGPU_PROFILE): cycles accumulated by
+// lane 0 of the first warp, reported by the kernels' host wrappers
+#ifdef GPU_PROFILE
+enum ProfileSection
+{
+	PROF_SET_CONF, PROF_SET_ATOMS, PROF_SET_FRAME, PROF_INTER, PROF_PAIRS,
+	PROF_PAIR_PASS1, PROF_PAIR_PASS2, PROF_DERIV, PROF_EVAL_TOTAL,
+	PROF_BFGS_TOTAL, PROF_MUTATE, PROF_OUTPUT, PROF_MC_TOTAL, PROF_EVALS,
+	PROF_COUNT
+};
+__device__ unsigned long long g_prof[PROF_COUNT];
+#define PROF_START(v) long long v = clock64()
+#define PROF_ADD(sec, v) \
+	if (blockIdx.x == 0 && threadIdx.x == 0) \
+		g_prof[sec] += clock64() - (v)
+#define PROF_COUNT_ADD(sec, n) \
+	if (blockIdx.x == 0 && threadIdx.x == 0) \
+		g_prof[sec] += (n)
+#else
+#define PROF_START(v)
+#define PROF_ADD(sec, v)
+#define PROF_COUNT_ADD(sec, n)
+#endif
+
 // model::set: ligands.set_conf then flex.set_conf, frames level by level
 template<typename T, int TPC> __device__ void set_conf(const ModelView<T>& mv,
 		const T* conf, EvalScratch<T>& ws, const Group<TPC>& G)
 {
 	for (int lv = 0; lv < mv.d.num_levels; lv++)
 	{
+		PROF_START(tf);
 		for (int k = mv.level_start[lv] + G.rank; k < mv.level_start[lv + 1];
 				k += TPC)
 		{
@@ -465,9 +490,11 @@ template<typename T, int TPC> __device__ void set_conf(const ModelView<T>& mv,
 			for (int j = 0; j < 9; j++)
 				ws.frame_m[9 * fi + j] = m.d[j];
 		}
+		PROF_ADD(PROF_SET_FRAME, tf);
 		G.sync();
 	}
 	// atom_frame::set_coords: origin + orientation_m * local
+	PROF_START(ta);
 	for (int i = G.rank; i < mv.d.num_movable; i += TPC)
 	{
 		const int fi = mv.atom_frame[i];
@@ -479,6 +506,7 @@ template<typename T, int TPC> __device__ void set_conf(const ModelView<T>& mv,
 		store3(ws.coords + 3 * i, c);
 	}
 	G.sync();
+	PROF_ADD(PROF_SET_ATOMS, ta);
 }
 
 ////////////////////////////// interactions //////////////////////////////
@@ -700,6 +728,7 @@ template<typename T, int KIND, int NC, int TPC> __device__ T pairs_two_pass(
 	const int list0_end = mv.list_start[1];
 	T* pf = ws.pair_buf;
 	T part = 0;
+	PROF_START(tp1);
 #pragma unroll 2
 	for (int k = G.rank; k < npairs; k += TPC)
 	{
@@ -719,6 +748,8 @@ template<typename T, int KIND, int NC, int TPC> __device__ T pairs_two_pass(
 		store3(pf + 3 * k, force);
 	}
 	G.sync();
+	PROF_ADD(PROF_PAIR_PASS1, tp1);
+	PROF_START(tp2);
 	for (int i = G.rank; i < mv.d.num_movable; i += TPC)
 	{
 		vec3<T> f = load3(ws.forces + 3 * i);
@@ -734,6 +765,7 @@ template<typename T, int KIND, int NC, int TPC> __device__ T pairs_two_pass(
 		}
 		store3(ws.forces + 3 * i, f);
 	}
+	PROF_ADD(PROF_PAIR_PASS2, tp2);
 	return G.sum(part);
 }
 
@@ -804,28 +836,8 @@ template<typename T, int TPC> __device__ void derivative(
 	}
 }
 
-// optional section timers (build with -DGPU_PROFILE): cycles accumulated by
-// lane 0 of the first warp, reported by the kernels' host wrappers
-#ifdef GPU_PROFILE
-enum ProfileSection
-{
-	PROF_SET_CONF, PROF_INTER, PROF_PAIRS, PROF_DERIV, PROF_EVAL_TOTAL,
-	PROF_BFGS_TOTAL, PROF_MUTATE, PROF_OUTPUT, PROF_MC_TOTAL, PROF_EVALS,
-	PROF_COUNT
-};
-__device__ unsigned long long g_prof[PROF_COUNT];
-#define PROF_START(v) long long v = clock64()
-#define PROF_ADD(sec, v) \
-	if (blockIdx.x == 0 && threadIdx.x == 0) \
-		g_prof[sec] += clock64() - (v)
-#define PROF_COUNT_ADD(sec, n) \
-	if (blockIdx.x == 0 && threadIdx.x == 0) \
-		g_prof[sec] += (n)
-#else
-#define PROF_START(v)
-#define PROF_ADD(sec, v)
-#define PROF_COUNT_ADD(sec, n)
-#endif
+// GPU_CHAIN_STATS diagnostics: evaluations per thread group (null: off)
+__device__ unsigned long long* g_group_evals;
 
 // model::eval_deriv; v = {intra-ligand, intermolecular, other pairs}
 template<typename T, bool ORDERED, int TPC> __device__ T eval_deriv(
@@ -861,6 +873,8 @@ template<typename T, bool ORDERED, int TPC> __device__ T eval_deriv(
 	PROF_ADD(PROF_DERIV, t3);
 	PROF_ADD(PROF_EVAL_TOTAL, t0);
 	PROF_COUNT_ADD(PROF_EVALS, 1);
+	if (g_group_evals && G.rank == 0)
+		g_group_evals[blockIdx.x * (blockDim.x / TPC) + G.gid]++;
 	return e;
 }
 

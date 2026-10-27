@@ -89,7 +89,9 @@ Tools: `src/gpu/tests/gpu_eval_test` (grids and evaluations),
 throughput), `smina_portable` (smina built against the portable-math library,
 with and without `--gpu --gpu_fp64`), `tools/redock_benchmark.py`,
 `tools/compare_minimize.py`. `GPU_ITEM_TIMES=1` prints when each pose of a
-local optimization finished.
+local optimization finished; `GPU_CHAIN_STATS=1` prints, for every search
+launch, the last chains to finish with their evaluation counts and the mean
+time per evaluation; `-DGPU_PROFILE` builds report per-section cycles.
 
 ## Performance
 
