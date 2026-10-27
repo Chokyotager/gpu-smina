@@ -7,6 +7,11 @@ Metropolis acceptance, output clustering, the precalculated pair tables
 step counts, seeding and parameters are those of CPU smina. Without `--gpu`
 the program behaves exactly as before.
 
+`--gpu_split N` additionally offers a GPU-style search that is *not* smina's:
+every Monte Carlo chain is replaced by N concurrent chains with 1/N of its
+steps. It docks a single complex up to nine times faster with the same
+redocking success (see below).
+
 ## Building
 
 Dependencies: Boost (≥ 1.70), OpenBabel (2.x or 3.x), CMake ≥ 3.18 and the
@@ -27,6 +32,7 @@ ninja -C build smina
 ```
 smina -r rec.pdb -l ligands.sdf --autobox_ligand ref.sdf --gpu -o out.sdf
 smina ... --gpu --device 0,1          # several GPUs
+smina ... --gpu --gpu_split 16        # GPU-style search (not 1:1, see below)
 smina ... --minimize --gpu            # batched local optimization
 ```
 
@@ -77,8 +83,9 @@ not depend on it.
   (73.6%), GPU 90/125 (72.0%); mean top score −9.835 vs −9.818 kcal/mol;
   per-complex outcomes agree; the differences are within run-to-run noise
   (permutation tests p = 0.60 and 0.51).
-* **Screening** (210 ligands, 1HSG box): per-ligand top score GPU − CPU has
-  median 0.000 and s.d. 0.10 kcal/mol.
+* **Screening** (210 ligands, 1HSG box, exhaustiveness 8): per-ligand top
+  score GPU − CPU has median +0.001 and s.d. 0.074 kcal/mol; two CPU runs with
+  different seeds differ by s.d. 0.073.
 * **`--minimize`**, 1890 docked poses: output identical to the CPU's (energies
   and coordinates). 1890 random, mostly clashing poses (`--randomize_only`
   output): these minimizations are chaotic — two CPU builds that differ only
@@ -88,10 +95,19 @@ not depend on it.
   minimizations are bit-identical for all 1890 once the CPU cell-list quirk
   described below is excluded (`GPU_TEST_FULL_CELLS`), 1888/1890 with it.
 
+* **GPU-style search** (`--gpu_split`), the same 25 Astex complexes × 5 seeds:
+  N = 8, 16 and 32 each succeed for 91/125 (72.8%) with mean top scores
+  −9.846, −9.843 and −9.843 kcal/mol; against the CPU (92/125, −9.835), −1
+  success (permutation p = 1.00) and 0.01 kcal/mol better (p ≥ 0.25). On the
+  210-ligand screen the top scores differ from the CPU's by s.d. 0.089, 0.075
+  and 0.084 kcal/mol for N = 4, 8 and 16 (means within 0.003). Validated on
+  rigid receptors with the default scoring.
+
 Tools: `src/gpu/tests/gpu_eval_test` (grids and evaluations),
 `src/gpu/tests/gpu_mc_test` (trajectories, `--minimize`, determinism,
 throughput), `smina_portable` (smina built against the portable-math library,
-with and without `--gpu --gpu_fp64`), `tools/redock_benchmark.py`,
+with and without `--gpu --gpu_fp64`), `tools/redock_benchmark.py` with
+`tools/compare_redock.py`, `tools/compare_screen.py`,
 `tools/compare_minimize.py`. `GPU_ITEM_TIMES=1` prints when each pose of a
 local optimization finished; `GPU_CHAIN_STATS=1` prints, for every search
 launch, the last chains to finish with their evaluation counts and the mean
@@ -103,21 +119,23 @@ Ryzen 9 5950X (16 cores, 32 threads); RTX 4080 SUPER and RTX 4070 Ti SUPER;
 CPU smina built from this tree (`-O3`, same compiler); idle machine, wall
 clock times including input and output.
 
-| workload | CPU smina | `smina --gpu` |
-|---|---|---|
-| 1HSG redocking, exhaustiveness 8 | 43 s (`--cpu 8`) | 26 s |
-| … exhaustiveness 32 | 58 s (`--cpu 32`) | 44 s |
-| … exhaustiveness 128 | 173 s (`--cpu 32`) | 47 s |
-| 1HSG, flexible residues A:50 and B:50, exhaustiveness 8 | 41 s (`--cpu 8`) | 48 s |
-| screening 210 ligands (1HSG box, exhaustiveness 8) | 236 s (32 single-threaded processes) | 33 s (RTX 4080 SUPER), 25 s (both GPUs) |
-| screening 840 ligands (the 210, four times) | not measured | 74 s (RTX 4080 SUPER) |
-| `--minimize`, 1890 docked poses | 0.47 s (32 processes), 4.8 s (1 process) | 2.3 s |
-| `--minimize`, 1890 random poses | 4.4 s (32 processes), 49 s (1 process) | 13 s |
+| workload | CPU smina | `--gpu` (1:1) | `--gpu --gpu_split N` |
+|---|---|---|---|
+| 1HSG redocking, exhaustiveness 8 | 43 s (`--cpu 8`) | 26 s | 6.4 s (N = 8), 4.2 s (16), 2.9 s (32) |
+| … exhaustiveness 32 | 58 s (`--cpu 32`) | 44 s | |
+| … exhaustiveness 128 | 173 s (`--cpu 32`) | 47 s | |
+| Astex set, exhaustiveness 8, per complex | | 16.8 s | 3.6 s (8), 2.7 s (16), 2.1 s (32) |
+| 1HSG, flexible residues A:50 and B:50, exhaustiveness 8 | 41 s (`--cpu 8`) | 48 s | |
+| screening 210 ligands (1HSG box, exhaustiveness 8): one GPU / both | 236 s (32 single-threaded processes) | 32 s / 19.5 s | 18.5 s / 12.4 s (N = 8) |
+| screening 840 ligands (the 210, four times): one GPU / both | not measured | 57 s / 47 s | 62 s / 37 s (N = 4) |
+| `--minimize`, 1890 docked poses | 0.47 s (32 processes), 4.8 s (1 process) | 2.3 s | |
+| `--minimize`, 1890 random poses | 4.4 s (32 processes), 49 s (1 process) | 13 s | |
 
-Single-complex runs used one GPU (the default, device 0). Times are single
-runs (screens: mean of 4 seeds); a run takes as long as its slowest search
-chain, and single precision trajectories differ between seeds, so times vary
-by about ±10%.
+Single-complex runs used one GPU (the default, device 0, an RTX 4080 SUPER);
+the Astex runs used one GPU per complex; "one GPU" screens the RTX 4080
+SUPER. Times are single runs; a run takes as long as its
+slowest search chain, and single precision trajectories differ between seeds,
+so times vary by about ±10%.
 
 The search is a set of independent but internally sequential Monte Carlo
 chains (exhaustiveness 8 means 8 chains of tens of thousands of steps). A
@@ -127,19 +145,28 @@ chains run at once — many ligands, or higher exhaustiveness.
 
 A launch lasts as long as its slowest chain, and chains differ severalfold in
 work: the number of steps grows with the ligand's size and flexibility, and
-the number of evaluations per step varies with the trajectory, up to
-threefold between chains of the same ligand. Per chain, an evaluation takes
-about as long with 128 threads as with 256, 1.2 times as long with 64 and 2-5
-times as long with 32 (which has the best throughput). So the GPU code uses
-the most threads per chain that keep every chain resident (single complexes:
-exhaustiveness 128 takes 47 s, against 64 s in two waves at 256 threads); 64
+the number of evaluations per step varies with the trajectory, up to threefold
+between chains of the same ligand. Per chain, an evaluation takes about as
+long with 128 threads as with 256, 1.2 times as long with 64 and 2-5 times as
+long with 32 (which has the best throughput). So the GPU code uses the most
+threads per chain that keep every chain resident (single complexes:
+exhaustiveness 128 takes 47 s, against 62 s in two waves at 256 threads); 64
 threads when the chains would make a single wave at 32 (the longest chains
 start first and run 2-4 times faster, the short ones fill in behind: 210
-ligands on one GPU take 33 s instead of 41 s); and 32 threads beyond that.
-The 840-ligand screen reaches about 77% of the GPU's throughput. Giving the
-remaining chains more threads as others finish (chains can stop and resume
-exactly) did not do better: the boundaries are barriers held by the
+ligands on one GPU take 32 s instead of 37 s); and 32 threads beyond that.
+Giving the remaining chains more threads as others finish (chains can stop and
+resume exactly) did not do better: the boundaries are barriers held by the
 slowest chain, whose excess work no estimate made in advance predicts.
+
+`--gpu_split N` attacks both problems: N times as many chains fill the GPU for
+a single complex, and N times shorter chains shorten a screen's tail. It pays
+off where the GPU would otherwise idle — single complexes (6 times faster at N
+= 16, 9 times at N = 32) and small screens (1.7 times on one GPU, 1.6 times on
+two at N = 8). The shorter chains need more evaluations for the same number of
+steps (19% more at N = 8: more of each chain is spent descending from its
+random start), so a screen that already keeps one GPU busy gains nothing (840
+ligands: 57 s at N = 1, 62 s at N = 4); on two GPUs, N = 4 still helps (47 s →
+37 s).
 
 `--minimize` gains nothing over a multi-core CPU. Minimizing a docked pose
 costs about 2 ms of CPU time; the GPU does all 1890 in 0.14 s, but the rest of
