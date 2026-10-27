@@ -612,10 +612,17 @@ template<typename T, bool ORDERED, int TPC> __device__ void monte_carlo_chain(
 		*cv.count = 0;
 	G.sync();
 
+	// progress lives in host memory: every update is an atomic across PCIe,
+	// so steps are reported 32 at a time (per step, thousands of chains
+	// stall on them, and two GPUs updating one counter serialize)
+	unsigned unreported = 0;
 	for (unsigned step = start; step < prm.num_steps; step++)
 	{
-		if (progress && G.rank == 0)
-			atomicAdd(progress, 1u);
+		if (progress && G.rank == 0 && ++unreported == 32)
+		{
+			atomicAdd(progress, unreported);
+			unreported = 0;
+		}
 		PROF_START(tm);
 		copy_n(cv.cand, cv.tmp, csz, G);
 		if (G.rank == 0)
@@ -647,6 +654,8 @@ template<typename T, bool ORDERED, int TPC> __device__ void monte_carlo_chain(
 			}
 		}
 	}
+	if (progress && G.rank == 0 && unreported)
+		atomicAdd(progress, unreported);
 	PROF_ADD(PROF_MC_TOTAL, tmc);
 }
 
