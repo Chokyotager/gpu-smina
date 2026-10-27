@@ -91,8 +91,10 @@ struct EngineBase
 	Residency mc_res, bfgs_res; // of this engine's kernels
 	int chain_split; // GpuSettings::chain_split
 	double step_fraction; // GpuSettings::step_fraction
+	bool skip_visited; // GpuSettings::skip_visited
 	explicit EngineBase(int d) :
-			device(d), sm_count(1), chain_split(1), step_fraction(1)
+			device(d), sm_count(1), chain_split(1), step_fraction(1),
+					skip_visited(false)
 	{
 		cudaDeviceProp prop;
 		cuda_check(cudaSetDevice(device), "cudaSetDevice");
@@ -302,6 +304,7 @@ struct Engine: public EngineBase
 		std::vector<ChainInput> chains;
 		add_chains(chains, m, fm, 0, par, generator, corner1, corner2);
 		MCParams prm = mc_params(par.mc);
+		prm.visited = skip_visited;
 
 		unsigned* counter = 0;
 		ProgressPoller* poller = 0;
@@ -491,7 +494,8 @@ void Engine<T>::dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
 				corner1, corner2);
 	}
 	first_chain[njobs] = chains.size();
-	const MCParams prm = mc_params(jobs[0]->par.mc);
+	MCParams prm = mc_params(jobs[0]->par.mc);
+	prm.visited = skip_visited;
 	std::vector<ChainResult> results;
 	run_monte_carlo(models, tables, context(true, cache_slope), prm, chains,
 			results, progress, tpc, &mc_res);
@@ -571,6 +575,7 @@ GpuDocking::GpuDocking(const GpuSettings& s) :
 			engines.push_back(new Engine<float>(d));
 		engines.back()->chain_split = std::max(1, settings.chain_split);
 		engines.back()->step_fraction = settings.step_fraction;
+		engines.back()->skip_visited = settings.skip_visited;
 	}
 }
 

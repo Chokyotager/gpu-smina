@@ -30,8 +30,11 @@ struct GpuSettings
 	int chain_split;
 	// fraction of smina's Monte Carlo steps to run (1: smina's search)
 	double step_fraction;
+	// not smina's search: QuickVina 2's check skips local optimizations
+	// that would revisit known minima
+	bool skip_visited;
 	GpuSettings() : fp64(false), threads_per_chain(0), chain_split(1),
-			step_fraction(1) {}
+			step_fraction(1), skip_visited(false) {}
 };
 
 // parse "0,1" into device ordinals

@@ -387,6 +387,12 @@ __device__ ChainView<T> make_chain_view(T* hot, T* mem, int* imem,
 	cv.out_coords = mem + co.out_coords;
 	cv.order = imem + co.order;
 	cv.count = imem + co.count;
+	cv.vis.max_n = co.vis_n;
+	cv.vis.x = mem + co.vis_x;
+	cv.vis.f = mem + co.vis_f;
+	cv.vis.scratch = mem + co.vis_scratch;
+	cv.vis.bits = reinterpret_cast<unsigned*>(imem + co.vis_bits);
+	cv.vis.state = imem + co.vis_state;
 	return cv;
 }
 
@@ -612,7 +618,8 @@ void run_monte_carlo(const DeviceModels<T>& models,
 			models.max_list, models.max_pairs, Ordered<T>::value);
 	ChainOffsets co = chain_layout(models.max_conf, models.max_change,
 			models.max_heavy, params.num_saved_mins, models.max_movable,
-			models.max_frames);
+			models.max_frames,
+			params.visited ? std::min(models.max_change, 64) : 0);
 
 	std::vector<int> cmodel(nchains);
 	std::vector<MTState> rng(nchains);

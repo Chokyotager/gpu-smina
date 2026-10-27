@@ -49,6 +49,7 @@ MCParams mc_params(const monte_carlo& mc)
 	p.min.maxiters = mp.maxiters;
 	p.min.accurate_line = mp.type == minimization_params::BFGSAccurateLineSearch;
 	p.min.early_term = mp.early_term;
+	p.visited = 0;
 	return p;
 }
 

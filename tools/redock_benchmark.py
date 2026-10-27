@@ -2,6 +2,7 @@
 """Redocking validation: CPU smina vs GPU smina on the Astex test set.
 
 usage: redock_benchmark.py [--gpu-only] [--gpu-args "..."] [--label name]
+                           [--trace-dir dir]
                            cpu_smina gpu_smina testdata_dir out_dir seeds...
 
 For every complex (dir with rec.pdb, lig.sdf) and seed, docks lig.sdf back
@@ -13,6 +14,8 @@ concurrently (CPU: 4 jobs x 8 threads; GPU: one job per device).
 --gpu-only skips the CPU runs, --gpu-args adds options to the GPU runs
 (e.g. "--gpu_split 16") and --label names the GPU runs' files and results
 (default "gpu"); results.json keeps the entries of earlier runs.
+--trace-dir writes each GPU run's GPU_TRACE_STEPS file to
+dir/<complex>_s<seed>.tsv.
 """
 import json
 import os
@@ -40,19 +43,20 @@ def top_score(out):
         return None
 
 
-def run(binary, cdir, seed, out, extra):
+def run(binary, cdir, seed, out, extra, env=None):
     cmd = [binary, "-r", os.path.join(cdir, "rec.pdb"), "-l",
            os.path.join(cdir, "lig.sdf"), "--autobox_ligand",
            os.path.join(cdir, "lig.sdf"), "--seed", str(seed), "-o", out,
            "-q"] + extra
     t = time.time()
-    subprocess.run(cmd, capture_output=True, timeout=7200)
+    subprocess.run(cmd, capture_output=True, timeout=7200,
+                   env=dict(os.environ, **env) if env else None)
     return time.time() - t
 
 
 def main():
     args = sys.argv[1:]
-    gpu_only, gpu_args, label = False, [], "gpu"
+    gpu_only, gpu_args, label, trace_dir = False, [], "gpu", None
     while args and args[0].startswith("--"):
         opt = args.pop(0)
         if opt == "--gpu-only":
@@ -61,6 +65,9 @@ def main():
             gpu_args = args.pop(0).split()
         elif opt == "--label":
             label = args.pop(0)
+        elif opt == "--trace-dir":
+            trace_dir = args.pop(0)
+            os.makedirs(trace_dir, exist_ok=True)
     cpu, gpu, data, outdir = args[:4]
     seeds = [int(s) for s in args[4:]] or [1, 2, 3, 4, 5]
     os.makedirs(outdir, exist_ok=True)
@@ -80,8 +87,14 @@ def main():
     def gpu_job(cs, device):
         c, s = cs
         out = os.path.join(outdir, "%s_s%d_%s.sdf" % (c, s, label))
+        env = None
+        if trace_dir:
+            path = os.path.join(trace_dir, "%s_s%d.tsv" % (c, s))
+            if os.path.exists(path):
+                os.remove(path)
+            env = {"GPU_TRACE_STEPS": path}
         t = run(gpu, os.path.join(data, c), s, out,
-                ["--gpu", "--device", str(device)] + gpu_args)
+                ["--gpu", "--device", str(device)] + gpu_args, env)
         ref = os.path.join(data, c, "lig.sdf")
         return (label, c, s, t, top_rmsd(ref, out), top_score(out))
 

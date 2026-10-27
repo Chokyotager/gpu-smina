@@ -915,6 +915,7 @@ Thank you!\n";
 		int gpu_threads = 0;
 		int gpu_split = 1;
 		double gpu_budget = 1;
+		bool gpu_qvina = false;
 		bool gpu_fp64 = false;
 		int gpu_ligands_per_batch = 0;
 
@@ -1033,6 +1034,8 @@ Thank you!\n";
 				"Use double precision GPU kernels (for validation; slow on consumer GPUs)")
 		("gpu_batch", value<int>(&gpu_ligands_per_batch)->default_value(0),
 				"Ligands docked together on the GPU (0 chooses automatically)")
+		("gpu_qvina", bool_switch(&gpu_qvina),
+				"Skip local optimizations that QuickVina 2's history check deems redundant (not smina's search; for experiments)")
 		("gpu_budget", value<double>(&gpu_budget)->default_value(1),
 				"Fraction of smina's Monte Carlo steps to run on the GPU (not smina's search unless 1; for experiments)")
 #endif
@@ -1370,6 +1373,7 @@ Thank you!\n";
 			if (!(gpu_budget > 0))
 				throw usage_error("--gpu_budget must be positive");
 			gs.step_fraction = gpu_budget;
+			gs.skip_visited = gpu_qvina;
 			gpu.reset(new gpusmina::GpuDocking(gs));
 			gpu_engine = gpu.get();
 			log << "Using " << gpu->description() << "\n";

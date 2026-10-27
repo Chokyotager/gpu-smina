@@ -28,6 +28,9 @@ struct MCParams
 	double hunt_cap[3];
 	double authentic_v[3];
 	MinParams min;
+	// not smina's search: skip local optimizations QuickVina 2's history
+	// check deems redundant (see visited_interesting)
+	int visited;
 };
 
 // element offsets (in T) of one chain's block of floating point state
@@ -39,9 +42,26 @@ struct ChainOffsets
 	// a chain stopped between steps: current energy, best energy, and the
 	// model state mutation reads (atom coordinates, frame origins)
 	int resume_e, resume_coords, resume_origins;
+	// QuickVina 2's history (MCParams::visited): points (5n x n), energies,
+	// scratch (n + 5n); in the int block, gradient sign bits (4 per point)
+	// and the state (size, next slot, full).  vis_n: the n storage is
+	// sized for (0: no history)
+	int vis_x, vis_f, vis_scratch, vis_n;
 	int total;
 	// int block: sorted order of the output storage, then its size
-	int order, count, int_total;
+	int order, count, vis_bits, vis_state, int_total;
+};
+
+// a chain's QuickVina 2 history (null pointers: none)
+template<typename T>
+struct Visited
+{
+	T* x;
+	T* f;
+	T* scratch;
+	unsigned* bits;
+	int* state;
+	int max_n;
 };
 
 // everything bfgs needs besides the conf being minimized
@@ -71,10 +91,12 @@ struct ChainView
 	T* out_coords;
 	int* order;
 	int* count;
+	Visited<T> vis;
 };
 
 inline ChainOffsets chain_layout(int conf_size, int change_size, int num_heavy,
-		int num_saved, int num_movable = 0, int num_frames = 0)
+		int num_saved, int num_movable = 0, int num_frames = 0,
+		int visited_n = 0)
 {
 	ChainOffsets o;
 	int at = 0;
@@ -114,10 +136,19 @@ inline ChainOffsets chain_layout(int conf_size, int change_size, int num_heavy,
 	at += 3 * num_movable;
 	o.resume_origins = at;
 	at += 3 * num_frames;
+	o.vis_n = visited_n;
+	o.vis_x = at;
+	at += 5 * visited_n * visited_n;
+	o.vis_f = at;
+	at += 5 * visited_n;
+	o.vis_scratch = at;
+	at += 6 * visited_n;
 	o.total = at;
 	o.order = 0;
 	o.count = num_saved;
-	o.int_total = num_saved + 1;
+	o.vis_bits = num_saved + 1;
+	o.vis_state = o.vis_bits + 4 * 5 * visited_n;
+	o.int_total = o.vis_state + (visited_n ? 3 : 0);
 	return o;
 }
 

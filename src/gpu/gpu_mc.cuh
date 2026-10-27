@@ -141,6 +141,128 @@ template<typename T> __device__ T conf_value(const ModelView<T>& mv,
 	return 0;
 }
 
+////////////////////////////// QuickVina 2 history //////////////////////////////
+
+// Not smina's search (MCParams::visited).  QuickVina 2 (Alhossary et al.,
+// Bioinformatics 2015; github.com/QVina/qvina, branch qvina2: visited.h,
+// visited.cpp, bfgs.h): each chain keeps the last 5n points its local
+// optimizations visited (n degrees of freedom; conf in change indexing, its
+// energy and the signs of its gradient).  A local optimization only runs if
+// its starting point is "interesting": one of the 4n history points nearest
+// to it passes the first-order consistency check -- in every coordinate in
+// which both gradients have the same nonzero sign, (gradient > 0) equals
+// (x > x_e) xor (f > f_e).  Until the history is full every point is
+// interesting.  Otherwise the optimization is skipped and the starting
+// energy returned.
+
+__device__ inline bool vis_bit(const unsigned* b, int i)
+{
+	return ((i < 32 ? b[0] >> i : b[1] >> (i - 32)) & 1u) != 0;
+}
+
+template<typename T, int TPC> __device__ void visited_add(const Visited<T>& V,
+		const ModelView<T>& mv, const T* x, T f, const T* g, const Group<TPC>& G)
+{
+	const int n = mv.d.change_size;
+	if (n > V.max_n)
+		return;
+	const int cap = 5 * n;
+	int slot = 0;
+	if (G.rank == 0)
+	{
+		int* s = V.state; // size, next slot, full
+		if (!s[2])
+		{
+			slot = s[0]++;
+			if (s[0] >= cap)
+			{
+				s[2] = 1;
+				s[1] = 0;
+			}
+		}
+		else
+		{
+			slot = s[1];
+			s[1] = (s[1] + 1) % cap;
+		}
+		V.f[slot] = f;
+		unsigned zero[2] = {0, 0}, pos[2] = {0, 0};
+		for (int i = 0; i < n; i++)
+			if (g[i] == 0)
+				zero[i >> 5] |= 1u << (i & 31);
+			else if (g[i] > 0)
+				pos[i >> 5] |= 1u << (i & 31);
+		unsigned* b = V.bits + 4 * slot;
+		b[0] = zero[0];
+		b[1] = zero[1];
+		b[2] = pos[0];
+		b[3] = pos[1];
+	}
+	slot = G.bcast(slot);
+	for (int i = G.rank; i < n; i += TPC)
+		V.x[slot * n + i] = conf_value(mv, x, i);
+	G.sync();
+}
+
+// visited::interesting: QuickVina 2 checks the 4n nearest points in order of
+// (distance, index) and stops at the first that passes; equivalently, the
+// nearest passing point must rank below 4n
+template<typename T, int TPC> __device__ bool visited_interesting(
+		const Visited<T>& V, const ModelView<T>& mv, const T* x, T f,
+		const T* g, const Group<TPC>& G)
+{
+	const int n = mv.d.change_size;
+	if (n > V.max_n)
+		return true;
+	// one reading for the whole group: rank 0 updates the state in
+	// visited_add, which a faster warp may otherwise reach first
+	if (!G.bcast(V.state[2]))
+		return true;
+	const int cap = 5 * n;
+	T* now = V.scratch;
+	T* dist = V.scratch + n;
+	for (int i = G.rank; i < n; i += TPC)
+		now[i] = conf_value(mv, x, i);
+	G.sync();
+	T best = max_value<T>();
+	int besti = cap;
+	for (int e = G.rank; e < cap; e += TPC)
+	{
+		const T* xe = V.x + e * n;
+		const unsigned* b = V.bits + 4 * e;
+		const bool newY = f - V.f[e] > 0;
+		T d2 = 0;
+		bool pass = true;
+		for (int i = 0; i < n; i++)
+		{
+			const T dx = xe[i] - now[i];
+			d2 += dx * dx;
+			if (vis_bit(b, i) || g[i] == 0)
+				continue;
+			const bool nowPos = g[i] > 0;
+			if (nowPos != vis_bit(b + 2, i))
+				continue;
+			const bool newX = now[i] - xe[i] > 0;
+			if (nowPos ^ newX ^ newY)
+				pass = false;
+		}
+		dist[e] = d2;
+		if (pass && d2 < best) // e ascends: the lowest index wins ties
+		{
+			best = d2;
+			besti = e;
+		}
+	}
+	G.argmin(best, besti);
+	if (besti >= cap)
+		return false;
+	G.sync();
+	int ahead = 0;
+	for (int e = G.rank; e < cap; e += TPC)
+		ahead += (dist[e] < best || (dist[e] == best && e < besti));
+	return G.sum(ahead) < 4 * n;
+}
+
 template<typename T>
 struct Objective // quasi_newton_aux
 {
@@ -325,7 +447,8 @@ template<typename T, int TPC> __device__ void set_diagonal(T* h, T x, int n, con
 
 // bfgs(): x is minimized in place, the final value is returned
 template<typename T, bool ORDERED, int TPC> __device__ T bfgs(const Objective<T>& f,
-		T* x, const BFGSWork<T>& w, const MinParams& params, const Group<TPC>& G)
+		T* x, const BFGSWork<T>& w, const MinParams& params, const Group<TPC>& G,
+		const Visited<T>* vis = 0)
 {
 	PROF_START(tb0);
 	const int n = f.mv.d.change_size;
@@ -334,6 +457,12 @@ template<typename T, bool ORDERED, int TPC> __device__ T bfgs(const Objective<T>
 	set_diagonal(w.h, T(1), n, G);
 
 	T f0 = evaluate<T, ORDERED>(f, x, w.g, G);
+	if (vis)
+	{
+		if (!visited_interesting(*vis, f.mv, x, f0, w.g, G))
+			return f0;
+		visited_add(*vis, f.mv, x, f0, w.g, G);
+	}
 	const T f_orig = f0;
 	copy_n(w.g_orig, w.g, n, G);
 	copy_n(w.x_orig, x, conf_size, G);
@@ -380,6 +509,8 @@ template<typename T, bool ORDERED, int TPC> __device__ T bfgs(const Objective<T>
 						n, G);
 		}
 		bfgs_update<T, ORDERED>(w.h, w.p, w.y, w.minus_hy, alpha, n, G);
+		if (vis)
+			visited_add(*vis, f.mv, x, f0, w.g, G);
 	}
 
 	if (!(f0 <= f_orig))
@@ -606,6 +737,7 @@ template<typename T, bool ORDERED, int TPC> __device__ void monte_carlo_chain(
 	const Objective<T> f_hunt(mv, tb, ic, hunt_cap, ic.slope, ic.box, ws);
 	const Objective<T> f_auth(mv, tb, ic, authentic_v, ic.slope, ic.box, ws);
 	const int csz = mv.d.conf_size;
+	const Visited<T>* vis = (prm.visited && cv.vis.max_n) ? &cv.vis : 0;
 
 	PROF_START(tmc);
 	if (start == 0 && G.rank == 0)
@@ -634,7 +766,8 @@ template<typename T, bool ORDERED, int TPC> __device__ void monte_carlo_chain(
 			mutate_conf(mv, cv.cand, T(prm.mutation_amplitude), ws, rng);
 		G.sync();
 		PROF_ADD(PROF_MUTATE, tm);
-		const T cand_e = bfgs<T, ORDERED>(f_hunt, cv.cand, cv.work, prm.min, G);
+		const T cand_e = bfgs<T, ORDERED>(f_hunt, cv.cand, cv.work, prm.min, G,
+				vis);
 		int accept = 0;
 		if (G.rank == 0)
 			accept = (step == 0)
@@ -647,7 +780,7 @@ template<typename T, bool ORDERED, int TPC> __device__ void monte_carlo_chain(
 			set_conf(mv, cv.tmp, ws, G);
 			if (tmp_e < best_e || *cv.count < prm.num_saved_mins)
 			{
-				tmp_e = bfgs<T, ORDERED>(f_auth, cv.tmp, cv.work, prm.min, G);
+				tmp_e = bfgs<T, ORDERED>(f_auth, cv.tmp, cv.work, prm.min, G, vis);
 				set_conf(mv, cv.tmp, ws, G);
 				PROF_START(to);
 				heavy_coords(mv, ws, cv.coords, G);
