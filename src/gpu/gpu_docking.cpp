@@ -655,7 +655,10 @@ size_t GpuDocking::chains_per_batch() const
 	size_t c = 0;
 	for (size_t i = 0; i < engines.size(); i++)
 		c += engines[i]->capacity();
-	return std::max<size_t>(1, 4 * c / std::max(1, settings.chain_split));
+	// with chain_split, the same ligands per batch (more, shorter chains
+	// pack the GPU better), up to 32 times the resident chains (memory)
+	return std::max<size_t>(1, std::min(4 * c,
+			32 * c / std::max(1, settings.chain_split)));
 }
 
 void GpuDocking::dock_batch(std::vector<DockJob*>& jobs, const precalculate& p,
