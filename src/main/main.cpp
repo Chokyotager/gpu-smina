@@ -916,6 +916,7 @@ Thank you!\n";
 		int gpu_split = 1;
 		double gpu_budget = 1;
 		bool gpu_qvina = false;
+		bool gpu_fast = false;
 		bool gpu_fp64 = false;
 		int gpu_ligands_per_batch = 0;
 
@@ -1062,6 +1063,8 @@ Thank you!\n";
 				("device", value<std::string>(&device_list)->default_value("0"),
 						"GPU device(s) to use, comma separated (e.g. 0,1)")
 				("gpu", bool_switch(&gpu_on), "Turn on GPU acceleration")
+				("fast", bool_switch(&gpu_fast),
+						"With --gpu: a faster GPU-style search that is not smina's: QuickVina 2's history check skips redundant local optimizations, the Monte Carlo chains are split into 4-32 shorter concurrent ones and run half of smina's steps (validated against smina; see README.GPU.md)")
 				("gpu_split", value<int>(&gpu_split)->default_value(1),
 						"GPU-style search (not smina's): replace every Monte Carlo chain by this many concurrent chains with 1/N of the steps each; faster, especially for single ligands (see README.GPU.md)")
 #endif
@@ -1358,6 +1361,8 @@ Thank you!\n";
 		gpusmina::GpuDocking* gpu_engine = NULL;
 #ifdef SMINA_GPU
 		boost::shared_ptr<gpusmina::GpuDocking> gpu;
+		if (gpu_fast && !gpu_on)
+			throw usage_error("--fast requires --gpu");
 		if (gpu_on)
 		{
 			if (approx == Exact)
@@ -1374,6 +1379,15 @@ Thank you!\n";
 				throw usage_error("--gpu_budget must be positive");
 			gs.step_fraction = gpu_budget;
 			gs.skip_visited = gpu_qvina;
+			if (gpu_fast)
+			{
+				// explicit --gpu_split / --gpu_budget take precedence
+				gs.skip_visited = true;
+				if (vm["gpu_split"].defaulted())
+					gs.chain_split = 0; // automatic
+				if (vm["gpu_budget"].defaulted())
+					gs.step_fraction = 0.5;
+			}
 			gpu.reset(new gpusmina::GpuDocking(gs));
 			gpu_engine = gpu.get();
 			log << "Using " << gpu->description() << "\n";

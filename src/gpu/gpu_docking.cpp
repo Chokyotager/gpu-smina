@@ -84,12 +84,28 @@ public:
 	}
 };
 
+// --fast (GpuSettings::chain_split 0): chains per search task when a device
+// docks `tasks` search tasks (exhaustiveness x ligands) at once: the largest
+// power of two from 4 to 32 that keeps the chains within 4 waves of what the
+// device holds at 32 threads per chain.  A few ligands leave most of the GPU
+// idle and get 32; a screen already fills the GPU and only gains at its
+// tail, while shorter chains need more evaluations for the same number of
+// steps.  At least 4: --fast also halves the steps, which longer chains do
+// not tolerate (screen top scores drift).  Measured: README.GPU.md.
+static int auto_split(size_t tasks, size_t capacity)
+{
+	int split = 32;
+	while (split > 4 && tasks * split > 4 * capacity)
+		split /= 2;
+	return split;
+}
+
 struct EngineBase
 {
 	int device;
 	int sm_count;
 	Residency mc_res, bfgs_res; // of this engine's kernels
-	int chain_split; // GpuSettings::chain_split
+	int chain_split; // GpuSettings::chain_split (0: automatic)
 	double step_fraction; // GpuSettings::step_fraction
 	bool skip_visited; // GpuSettings::skip_visited
 	explicit EngineBase(int d) :
@@ -132,20 +148,27 @@ struct EngineBase
 			const precalculate& p, const vec& corner1, const vec& corner2,
 			int seed, double cache_slope, const vec& cap, unsigned* progress,
 			int tpc) = 0;
+	// chains per search task when this device docks `tasks` tasks at once
+	int split_for(size_t tasks) const
+	{
+		return chain_split > 0 ? chain_split : auto_split(tasks, capacity());
+	}
+
 	// parallel_mc's tasks for a ligand, appended to `chains`: one chain per
 	// task, seeded in order from `generator` (parallel_mc::operator()); with
-	// chain_split n, n chains per task with 1/n of the steps each; with
+	// split n, n chains per task with 1/n of the steps each; with
 	// step_fraction f, f of the steps
 	void add_chains(std::vector<ChainInput>& chains, const model& m,
 			const FlatModel& fm, int model_index, const ::parallel_mc& par,
-			rng& generator, const vec& corner1, const vec& corner2) const
+			rng& generator, const vec& corner1, const vec& corner2,
+			int split) const
 	{
 		const MCParams mp = mc_params(par.mc);
-		VINA_FOR(i, par.num_tasks * chain_split)
+		VINA_FOR(i, par.num_tasks * split)
 		{
 			ChainInput c = make_chain(m, fm, model_index,
 					::random_int(0, 1000000, generator), corner1, corner2);
-			c.num_steps = chain_steps(mp.num_steps, chain_split, step_fraction);
+			c.num_steps = chain_steps(mp.num_steps, split, step_fraction);
 			c.maxiters = mp.min.maxiters;
 			chains.push_back(c);
 		}
@@ -302,7 +325,8 @@ struct Engine: public EngineBase
 		models.upload(fms);
 
 		std::vector<ChainInput> chains;
-		add_chains(chains, m, fm, 0, par, generator, corner1, corner2);
+		const int split = split_for(par.num_tasks);
+		add_chains(chains, m, fm, 0, par, generator, corner1, corner2, split);
 		MCParams prm = mc_params(par.mc);
 		prm.visited = skip_visited;
 
@@ -314,7 +338,7 @@ struct Engine: public EngineBase
 					cudaHostAllocMapped), "cudaHostAlloc");
 			*counter = 0;
 			poller = new ProgressPoller(counter, (unsigned long) chains.size()
-					* chain_steps(par.mc.num_steps, chain_split, step_fraction));
+					* chain_steps(par.mc.num_steps, split, step_fraction));
 		}
 		std::vector<ChainResult> results;
 		try
@@ -486,12 +510,16 @@ void Engine<T>::dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
 	// parallel_mc::operator())
 	std::vector<ChainInput> chains;
 	std::vector<size_t> first_chain(njobs + 1, 0);
+	size_t tasks = 0;
+	for (size_t j = 0; j < njobs; j++)
+		tasks += jobs[j]->par.num_tasks;
+	const int split = split_for(tasks);
 	for (size_t j = 0; j < njobs; j++)
 	{
 		rng generator(static_cast<rng::result_type>(seed));
 		first_chain[j] = chains.size();
 		add_chains(chains, *jobs[j]->m, fms[j], int(j), jobs[j]->par, generator,
-				corner1, corner2);
+				corner1, corner2, split);
 	}
 	first_chain[njobs] = chains.size();
 	MCParams prm = mc_params(jobs[0]->par.mc);
@@ -573,7 +601,7 @@ GpuDocking::GpuDocking(const GpuSettings& s) :
 			engines.push_back(new Engine<double>(d));
 		else
 			engines.push_back(new Engine<float>(d));
-		engines.back()->chain_split = std::max(1, settings.chain_split);
+		engines.back()->chain_split = std::max(0, settings.chain_split);
 		engines.back()->step_fraction = settings.step_fraction;
 		engines.back()->skip_visited = settings.skip_visited;
 	}
@@ -666,8 +694,9 @@ size_t GpuDocking::chains_per_batch() const
 		c += engines[i]->capacity();
 	// with chain_split, the same ligands per batch (more, shorter chains
 	// pack the GPU better), up to 32 times the resident chains (memory)
-	return std::max<size_t>(1, std::min(4 * c,
-			32 * c / std::max(1, settings.chain_split)));
+	if (settings.chain_split <= 0) // automatic: adapts to the batch
+		return 4 * c;
+	return std::max<size_t>(1, std::min(4 * c, 32 * c / settings.chain_split));
 }
 
 void GpuDocking::dock_batch(std::vector<DockJob*>& jobs, const precalculate& p,
@@ -692,11 +721,17 @@ void GpuDocking::dock_batch(std::vector<DockJob*>& jobs, const precalculate& p,
 	start[nd] = jobs.size();
 
 	unsigned long total_steps = 0;
-	const int split = settings.chain_split;
-	for (size_t j = 0; j < jobs.size(); j++)
-		total_steps += (unsigned long) jobs[j]->par.num_tasks * split
-				* EngineBase::chain_steps(jobs[j]->par.mc.num_steps, split,
-						settings.step_fraction);
+	for (size_t d = 0; d < nd; d++)
+	{
+		size_t tasks = 0;
+		for (size_t j = start[d]; j < start[d + 1]; j++)
+			tasks += jobs[j]->par.num_tasks;
+		const int split = engines[d]->split_for(tasks);
+		for (size_t j = start[d]; j < start[d + 1]; j++)
+			total_steps += (unsigned long) jobs[j]->par.num_tasks * split
+					* EngineBase::chain_steps(jobs[j]->par.mc.num_steps, split,
+							settings.step_fraction);
+	}
 	unsigned* counter = 0;
 	ProgressPoller* poller = 0;
 	if (display_progress)
