@@ -87,6 +87,7 @@ struct EngineBase
 {
 	int device;
 	int sm_count;
+	Residency mc_res, bfgs_res; // of this engine's kernels
 	explicit EngineBase(int d) :
 			device(d), sm_count(1)
 	{
@@ -121,40 +122,23 @@ struct EngineBase
 	virtual void prepare_docking(GpuDocking::DockJob* const* jobs, size_t njobs,
 			const precalculate& p, const grid_dims& gd, const grid& user_grid,
 			double cache_slope) = 0;
-	// search and refinement of `jobs` (after prepare_docking); threads per
-	// chain follow mc_phases for `sched_threads` resident threads
+	// search and refinement of `jobs` (after prepare_docking)
 	virtual void dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
 			const precalculate& p, const vec& corner1, const vec& corner2,
 			int seed, double cache_slope, const vec& cap, unsigned* progress,
-			int tpc, size_t sched_threads) = 0;
-	// concurrently resident chains (32 threads each)
+			int tpc) = 0;
+	// chains resident at 32 threads each (the throughput configuration)
 	size_t capacity() const
 	{
-		return size_t(sm_count) * 3 * 8;
+		return mc_res.items[0];
 	}
 
-	// threads the device keeps resident (3 blocks of 256 per SM)
-	size_t resident_threads() const
-	{
-		return size_t(sm_count) * 768;
-	}
-
-	// While every item fits on the GPU at once, a launch takes as long as
-	// its slowest item, so use the most threads per item that keeps them all
-	// resident; beyond that, 32 threads per item give the best throughput.
+	// threads per item for a bfgs launch: a launch takes as long as its
+	// slowest item, so use the most threads per item that keeps all items
+	// resident; beyond that, 32 threads per item give the best throughput
 	int choose_tpc(int requested, size_t items) const
 	{
-		return choose_tpc(requested, items, resident_threads());
-	}
-	static int choose_tpc(int requested, size_t items, size_t resident_threads)
-	{
-		if (requested > 0)
-			return requested;
-		const int options[3] = {256, 128, 64};
-		for (int i = 0; i < 3; i++)
-			if (items * options[i] <= resident_threads)
-				return options[i];
-		return 32;
+		return requested > 0 ? requested : bfgs_res.tpc(items);
 	}
 };
 
@@ -183,6 +167,8 @@ struct Engine: public EngineBase
 	{
 		cuda_check(cudaSetDevice(device), "cudaSetDevice");
 		preload_kernels<T>();
+		mc_res = mc_residency<T>();
+		bfgs_res = bfgs_residency<T>();
 	}
 	~Engine()
 	{
@@ -308,7 +294,7 @@ struct Engine: public EngineBase
 		try
 		{
 			run_monte_carlo(models, tables, context(true, cache_slope), prm,
-					chains, results, counter, tpc, resident_threads());
+					chains, results, counter, tpc, &mc_res);
 		} catch (...)
 		{
 			delete poller;
@@ -355,7 +341,7 @@ struct Engine: public EngineBase
 	void dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
 			const precalculate& p, const vec& corner1, const vec& corner2,
 			int seed, double cache_slope, const vec& cap, unsigned* progress,
-			int tpc, size_t sched_threads);
+			int tpc);
 
 	void minimize_batch(GpuDocking::MinimizeJob* jobs, size_t njobs,
 			const precalculate& p, const vec& cap, const grid& ug, int tpc)
@@ -454,8 +440,7 @@ struct Engine: public EngineBase
 template<typename T>
 void Engine<T>::dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
 		const precalculate& p, const vec& corner1, const vec& corner2, int seed,
-		double cache_slope, const vec& cap, unsigned* progress, int tpc,
-		size_t sched_threads)
+		double cache_slope, const vec& cap, unsigned* progress, int tpc)
 {
 	if (njobs == 0)
 		return;
@@ -494,7 +479,7 @@ void Engine<T>::dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
 	const MCParams prm = mc_params(jobs[0]->par.mc);
 	std::vector<ChainResult> results;
 	run_monte_carlo(models, tables, context(true, cache_slope), prm, chains,
-			results, progress, tpc, sched_threads);
+			results, progress, tpc, &mc_res);
 
 	// merge_output_containers per ligand
 	std::vector<output_type*> poses;
@@ -532,7 +517,7 @@ void Engine<T>::dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
 	const double v[3] = {cap[0], cap[1], cap[2]};
 	bool ok = run_refine(models, tables, context(false, 0),
 			min_params(jobs[0]->par.mc.ssd_par.minparm), v, pose_model, confs, e,
-			coords, choose_tpc(tpc, poses.size(), sched_threads), pose_maxiters);
+			coords, choose_tpc(tpc, poses.size()), pose_maxiters);
 	if (!ok)
 		throw std::runtime_error(
 				"Ligand atom exactly overlaps receptor atom.  I can't deal with this.");
@@ -713,7 +698,7 @@ void GpuDocking::dock_batch(std::vector<DockJob*>& jobs, const precalculate& p,
 			{
 				e->prepare_docking(first, n, p, gd, user_grid, cache_slope);
 				e->dock_sub(first, n, p, corner1, corner2, seed, cache_slope, cap,
-						counter, tpc, e->resident_threads());
+						counter, tpc);
 			} catch (std::exception& ex)
 			{
 				*err = ex.what();

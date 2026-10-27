@@ -105,12 +105,12 @@ clock times including input and output.
 
 | workload | CPU smina | `smina --gpu` |
 |---|---|---|
-| 1HSG redocking, exhaustiveness 8 | 43 s (`--cpu 8`) | 27 s |
-| … exhaustiveness 32 | 58 s (`--cpu 32`) | 47 s |
-| … exhaustiveness 128 | 173 s (`--cpu 32`) | 64 s |
+| 1HSG redocking, exhaustiveness 8 | 43 s (`--cpu 8`) | 26 s |
+| … exhaustiveness 32 | 58 s (`--cpu 32`) | 44 s |
+| … exhaustiveness 128 | 173 s (`--cpu 32`) | 47 s |
 | 1HSG, flexible residues A:50 and B:50, exhaustiveness 8 | 41 s (`--cpu 8`) | 48 s |
-| screening 210 ligands (1HSG box, exhaustiveness 8) | 236 s (32 single-threaded processes) | 35 s (RTX 4080 SUPER), 25 s (both GPUs) |
-| screening 840 ligands (the 210, four times) | not measured | 75 s (RTX 4080 SUPER) |
+| screening 210 ligands (1HSG box, exhaustiveness 8) | 236 s (32 single-threaded processes) | 33 s (RTX 4080 SUPER), 25 s (both GPUs) |
+| screening 840 ligands (the 210, four times) | not measured | 74 s (RTX 4080 SUPER) |
 | `--minimize`, 1890 docked poses | 0.47 s (32 processes), 4.8 s (1 process) | 2.3 s |
 | `--minimize`, 1890 random poses | 4.4 s (32 processes), 49 s (1 process) | 13 s |
 
@@ -125,18 +125,21 @@ single ligand at the default exhaustiveness therefore keeps only a few
 streaming multiprocessors busy and gains little; the GPU pays off when many
 chains run at once — many ligands, or higher exhaustiveness.
 
-A screen ends with its longest chains. Chains differ severalfold in work (the
-number of steps grows with the ligand's size and flexibility, and the number
-of evaluations per step varies with the trajectory, up to threefold between
-chains of the same ligand), so near the end of a batch most of the GPU idles.
-When a batch is a single wave of chains at 32 threads per chain, the search
-runs in phases that give the remaining chains 64, 128 and then 256 threads
-each as the others finish (chains resume exactly where they stopped; the
-phase boundaries depend only on the chains' estimated work, so results stay
-reproducible): 210 ligands on one GPU take 35 s instead of 41 s. The 840-ligand
-screen reaches about 77% of the GPU's throughput, the 210-ligand one about
-40%; the rest is the tail of trajectories that need far more evaluations than
-estimated, which no schedule fixed in advance can anticipate.
+A launch lasts as long as its slowest chain, and chains differ severalfold in
+work: the number of steps grows with the ligand's size and flexibility, and
+the number of evaluations per step varies with the trajectory, up to
+threefold between chains of the same ligand. Per chain, an evaluation takes
+about as long with 128 threads as with 256, 1.2 times as long with 64 and 2-5
+times as long with 32 (which has the best throughput). So the GPU code uses
+the most threads per chain that keep every chain resident (single complexes:
+exhaustiveness 128 takes 47 s, against 64 s in two waves at 256 threads); 64
+threads when the chains would make a single wave at 32 (the longest chains
+start first and run 2-4 times faster, the short ones fill in behind: 210
+ligands on one GPU take 33 s instead of 41 s); and 32 threads beyond that.
+The 840-ligand screen reaches about 77% of the GPU's throughput. Giving the
+remaining chains more threads as others finish (chains can stop and resume
+exactly) did not do better: the boundaries are barriers held by the
+slowest chain, whose excess work no estimate made in advance predicts.
 
 `--minimize` gains nothing over a multi-core CPU. Minimizing a docked pose
 costs about 2 ms of CPU time; the GPU does all 1890 in 0.14 s, but the rest of

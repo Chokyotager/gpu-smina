@@ -539,28 +539,40 @@ static void launch_monte_carlo(const DeviceModels<T>& models,
 	cuda_check(cudaStreamSynchronize(cudaStreamPerThread), "monte_carlo_kernel");
 }
 
-// Threads per chain over a search: chains run concurrently and finish at
-// different times (their work differs severalfold), so a single launch
-// spends its end with a few long chains on an otherwise idle device.
-// Phases relaunch the remaining chains with more threads each: phase k ends
-// where the estimated work of a chain reaches limit; the next phase uses the
-// most threads per chain that keep every remaining chain resident (the
-// residency rule of the first launch).  The schedule depends only on the
-// chains' estimated work, so results are reproducible.  (Work per chain also
-// varies with the trajectory, up to threefold between chains of one ligand,
-// which no estimate predicts: the slowest chain still sets the end.)
+// Threads per chain of a search.  Per chain, an evaluation takes about as
+// long with 128 threads as with 256 (one or two chains per SM), 1.2x as long
+// with 64 (four per SM) and 2-5x as long with 32 (eight to 24 per SM, the
+// best throughput); and a launch lasts as long as its slowest chain, with
+// chains differing severalfold in work.  Measured choices:
+//  * every chain resident with 128 or 256 threads (single complexes): the
+//    larger;
+//  * chains that would be a single wave at 32 threads: 64, even though not
+//    all of them stay resident: the block order puts the longest chains
+//    first, which then run 2-4x faster, and short ones fill in behind
+//    (210 ligands on one RTX 4080 SUPER: 33 s instead of 41 s);
+//  * more chains: 32, for throughput (840 ligands: 75 s, at 64: 124 s).
+// Relaunching the remaining chains with more threads each as others finish
+// (resuming them, see the kernel) did not do better: phase boundaries are
+// barriers held by the chain slowest to reach them, and work per chain
+// varies with the trajectory, up to threefold between chains of one ligand.
 //
-// threads_per_chain > 0: that many, one phase.  GPU_TEST_SLICES=n splits
-// the search into n phases of equal work alternating 32 and 256 threads per
-// chain (GPU_TEST_SLICES_TPC: one fixed value), to test resumption.
+// GPU_TEST_SLICES=n splits the search into n phases of equal work
+// alternating 32 and 256 threads per chain (GPU_TEST_SLICES_TPC: one fixed
+// value), to test resumption.
 struct MCPhase
 {
 	double limit; // work at which the phase ends (last phase: unused)
 	int tpc;
 };
 
+static int mc_tpc(const Residency& r, size_t n)
+{
+	const int t = r.tpc(n);
+	return (t == 32 && n <= r.items[0]) ? 64 : t;
+}
+
 static std::vector<MCPhase> mc_phases(const std::vector<double>& work,
-		int threads_per_chain, size_t resident_threads)
+		int threads_per_chain, const Residency* res)
 {
 	std::vector<MCPhase> phases;
 	const double max_work = *std::max_element(work.begin(), work.end());
@@ -576,50 +588,9 @@ static std::vector<MCPhase> mc_phases(const std::vector<double>& work,
 		}
 		return phases;
 	}
-	// Boundaries are barriers, which the chain slowest to reach one (a
-	// trajectory needing more evaluations than estimated) holds for all.
-	// Measured on screens, raising 32 threads per chain pays for that, but
-	// raising 64 does not; and with more chains than stay resident, chains
-	// of the first blocks would wait for blocks that started later.  So
-	// phases are used only for a single resident wave at 32 threads per
-	// chain.
-	const int options[4] = {32, 64, 128, 256};
-	const size_t n = work.size();
-	// the residency rule: the most threads per chain that keep every chain
-	// resident, else 32
-	int first = 0;
-	for (int i = 3; i > 0; i--)
-		if (n * options[i] <= resident_threads)
-		{
-			first = i;
-			break;
-		}
-	if (threads_per_chain > 0 || first > 0 || n * 32 > resident_threads)
-	{
-		MCPhase p = {max_work, threads_per_chain > 0 ? threads_per_chain
-				: options[first]};
-		phases.push_back(p);
-		return phases;
-	}
-	std::vector<double> desc(work);
-	std::sort(desc.begin(), desc.end(), std::greater<double>());
-	MCPhase p = {max_work, options[first]};
+	MCPhase p = {max_work, threads_per_chain > 0 ? threads_per_chain
+			: res ? mc_tpc(*res, work.size()) : 32};
 	phases.push_back(p);
-	for (int i = first + 1; i < 4; i++)
-	{
-		// beyond work `limit` at most resident_threads / tpc chains remain
-		const double limit = desc[resident_threads / options[i]];
-		const double start = phases.size() > 1 ? phases[phases.size() - 2].limit
-				: 0;
-		if (limit <= start)
-			phases.back().tpc = options[i]; // already few enough
-		else
-		{
-			phases.back().limit = limit;
-			MCPhase next = {max_work, options[i]};
-			phases.push_back(next);
-		}
-	}
 	return phases;
 }
 
@@ -628,7 +599,7 @@ void run_monte_carlo(const DeviceModels<T>& models,
 		const DeviceTables<T>& tables, const InterContext<T>& ic,
 		const MCParams& params, const std::vector<ChainInput>& chains,
 		std::vector<ChainResult>& results, unsigned* progress,
-		int threads_per_chain, size_t resident_threads)
+		int threads_per_chain, const Residency* residency)
 {
 	const int nchains = int(chains.size());
 	results.assign(nchains, ChainResult());
@@ -658,10 +629,10 @@ void run_monte_carlo(const DeviceModels<T>& models,
 			mem[size_t(c) * co.total + co.tmp + i] = T(chains[c].conf[i]);
 	}
 	const std::vector<MCPhase> phases = mc_phases(work, threads_per_chain,
-			resident_threads);
+			residency);
 	if (getenv("GPU_CHAIN_STATS"))
 	{
-		fprintf(stderr, "%d chains, phases:", nchains);
+		fprintf(stderr, "%d chains:", nchains);
 		for (size_t k = 0; k < phases.size(); k++)
 			fprintf(stderr, " [to %.3g: %d threads]", phases[k].limit,
 					phases[k].tpc);
@@ -697,7 +668,7 @@ void run_monte_carlo(const DeviceModels<T>& models,
 
 	// every phase resumes the unfinished chains where the previous one
 	// stopped: phase k runs chain c up to the first step at which its
-	// estimated work reaches phases[k].limit
+	// estimated work reaches phases[k].limit (one phase except in tests)
 	std::vector<unsigned> done(nchains, 0);
 	std::vector<uint4> limits(nchains);
 	for (size_t ph = 0; ph < phases.size(); ph++)
@@ -1057,6 +1028,47 @@ void preload_kernels()
 }
 
 template void preload_kernels<GPU_PRECISION>();
+
+// resident blocks of a kernel per SM (without dynamic shared memory: plans
+// keep a throughput launch within its share) times SMs times items per block
+static Residency residency_of(const void* k32, const void* k64,
+		const void* k128, const void* k256)
+{
+	int dev = 0, sms = 0;
+	cuda_check(cudaGetDevice(&dev), "cudaGetDevice");
+	cuda_check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev),
+			"multiprocessors");
+	const void* k[4] = {k32, k64, k128, k256};
+	Residency r;
+	for (int i = 0; i < 4; i++)
+	{
+		int blocks = 0;
+		cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, k[i],
+				BLOCK_THREADS, 0), "occupancy");
+		r.items[i] = size_t(std::max(blocks, 1)) * sms * (BLOCK_THREADS / (32 << i));
+	}
+	return r;
+}
+
+template<typename T>
+Residency mc_residency()
+{
+	return residency_of((const void*) monte_carlo_kernel<T, 32>,
+			(const void*) monte_carlo_kernel<T, 64>,
+			(const void*) monte_carlo_kernel<T, 128>,
+			(const void*) monte_carlo_kernel<T, 256>);
+}
+
+template<typename T>
+Residency bfgs_residency()
+{
+	return residency_of((const void*) bfgs_kernel<T, 32>,
+			(const void*) bfgs_kernel<T, 64>, (const void*) bfgs_kernel<T, 128>,
+			(const void*) bfgs_kernel<T, 256>);
+}
+
+template Residency mc_residency<GPU_PRECISION>();
+template Residency bfgs_residency<GPU_PRECISION>();
 template bool eval_confs<GPU_PRECISION>(const DeviceModels<GPU_PRECISION>&,
 		int, const DeviceTables<GPU_PRECISION>&,
 		const InterContext<GPU_PRECISION>&, const double[3],
@@ -1066,7 +1078,7 @@ template void run_monte_carlo<GPU_PRECISION>(
 		const DeviceModels<GPU_PRECISION>&, const DeviceTables<GPU_PRECISION>&,
 		const InterContext<GPU_PRECISION>&, const MCParams&,
 		const std::vector<ChainInput>&, std::vector<ChainResult>&, unsigned*,
-		int, size_t);
+		int, const Residency*);
 template bool run_bfgs<GPU_PRECISION>(const DeviceModels<GPU_PRECISION>&,
 		const DeviceTables<GPU_PRECISION>&, const InterContext<GPU_PRECISION>&,
 		const MinParams&, const double[3], const std::vector<int>&,
