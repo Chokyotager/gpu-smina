@@ -25,7 +25,10 @@ struct GpuSettings
 	std::vector<int> devices; // CUDA device ordinals
 	bool fp64; // double precision kernels (validation)
 	int threads_per_chain; // 0: automatic
-	GpuSettings() : fp64(false), threads_per_chain(0) {}
+	// GPU-style search (not smina's): every Monte Carlo chain is replaced by
+	// this many chains with 1/chain_split of its steps, run concurrently
+	int chain_split;
+	GpuSettings() : fp64(false), threads_per_chain(0), chain_split(1) {}
 };
 
 // parse "0,1" into device ordinals
@@ -89,7 +92,8 @@ public:
 	void minimize_batch(std::vector<MinimizeJob>& jobs, const precalculate& p,
 			const vec& cap, const grid& user_grid);
 
-	// chains that keep all devices busy; batches should provide this many
+	// search tasks (exhaustiveness units, each chain_split chains) that keep
+	// all devices busy; batches should provide this many
 	size_t chains_per_batch() const;
 
 	std::string description() const;

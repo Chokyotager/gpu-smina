@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Redocking validation: CPU smina vs GPU smina on the Astex test set.
 
-usage: redock_benchmark.py cpu_smina gpu_smina testdata_dir out_dir seeds...
+usage: redock_benchmark.py [--gpu-only] [--gpu-args "..."] [--label name]
+                           cpu_smina gpu_smina testdata_dir out_dir seeds...
 
 For every complex (dir with rec.pdb, lig.sdf) and seed, docks lig.sdf back
 into rec.pdb (autobox around the crystal ligand) with both binaries and
@@ -9,6 +10,9 @@ records the top-pose RMSD to the crystal pose (obrms, symmetry corrected),
 the top score and the wall time.  Results go to out_dir/results.json and a
 summary is printed.  CPU and GPU runs of different complexes are run
 concurrently (CPU: 4 jobs x 8 threads; GPU: one job per device).
+--gpu-only skips the CPU runs, --gpu-args adds options to the GPU runs
+(e.g. "--gpu_split 16") and --label names the GPU runs' files and results
+(default "gpu"); results.json keeps the entries of earlier runs.
 """
 import json
 import os
@@ -47,13 +51,24 @@ def run(binary, cdir, seed, out, extra):
 
 
 def main():
-    cpu, gpu, data, outdir = sys.argv[1:5]
-    seeds = [int(s) for s in sys.argv[5:]] or [1, 2, 3, 4, 5]
+    args = sys.argv[1:]
+    gpu_only, gpu_args, label = False, [], "gpu"
+    while args and args[0].startswith("--"):
+        opt = args.pop(0)
+        if opt == "--gpu-only":
+            gpu_only = True
+        elif opt == "--gpu-args":
+            gpu_args = args.pop(0).split()
+        elif opt == "--label":
+            label = args.pop(0)
+    cpu, gpu, data, outdir = args[:4]
+    seeds = [int(s) for s in args[4:]] or [1, 2, 3, 4, 5]
     os.makedirs(outdir, exist_ok=True)
     complexes = sorted(d for d in os.listdir(data)
                        if os.path.exists(os.path.join(data, d, "lig.sdf")))
     jobs = [(c, s) for c in complexes for s in seeds]
-    results = {}
+    path = os.path.join(outdir, "results.json")
+    results = json.load(open(path)) if os.path.exists(path) else {}
 
     def cpu_job(cs):
         c, s = cs
@@ -64,25 +79,24 @@ def main():
 
     def gpu_job(cs, device):
         c, s = cs
-        out = os.path.join(outdir, "%s_s%d_gpu.sdf" % (c, s))
+        out = os.path.join(outdir, "%s_s%d_%s.sdf" % (c, s, label))
         t = run(gpu, os.path.join(data, c), s, out,
-                ["--gpu", "--device", str(device)])
+                ["--gpu", "--device", str(device)] + gpu_args)
         ref = os.path.join(data, c, "lig.sdf")
-        return ("gpu", c, s, t, top_rmsd(ref, out), top_score(out))
+        return (label, c, s, t, top_rmsd(ref, out), top_score(out))
 
     with ThreadPoolExecutor(4) as cpool, ThreadPoolExecutor(2) as gpool:
-        futures = [cpool.submit(cpu_job, j) for j in jobs]
+        futures = [] if gpu_only else [cpool.submit(cpu_job, j) for j in jobs]
         futures += [gpool.submit(gpu_job, j, i % 2) for i, j in enumerate(jobs)]
         for f in futures:
             kind, c, s, t, rmsd, score = f.result()
             results.setdefault(c, {}).setdefault(str(s), {})[kind] = {
                 "time": t, "rmsd": rmsd, "score": score}
             print(kind, c, s, "%.1fs" % t, rmsd, score, flush=True)
-    json.dump(results, open(os.path.join(outdir, "results.json"), "w"),
-              indent=1)
+    json.dump(results, open(path, "w"), indent=1)
 
-    for kind in ("cpu", "gpu"):
-        rs = [results[c][str(s)][kind] for c, s in jobs]
+    for kind in (["gpu"] if gpu_only else ["cpu"]) + ([label] if label != "gpu" else ["gpu"]):
+        rs = [results[c][str(s)][kind] for c, s in jobs if kind in results[c][str(s)]]
         ok = [r for r in rs if r["rmsd"] is not None]
         succ = sum(1 for r in ok if r["rmsd"] < 2.0)
         print("%s: success (top pose < 2 A) %d/%d = %.1f%%, mean top score %.3f,"

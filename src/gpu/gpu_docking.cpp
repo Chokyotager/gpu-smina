@@ -88,8 +88,9 @@ struct EngineBase
 	int device;
 	int sm_count;
 	Residency mc_res, bfgs_res; // of this engine's kernels
+	int chain_split; // GpuSettings::chain_split
 	explicit EngineBase(int d) :
-			device(d), sm_count(1)
+			device(d), sm_count(1), chain_split(1)
 	{
 		cudaDeviceProp prop;
 		cuda_check(cudaSetDevice(device), "cudaSetDevice");
@@ -127,6 +128,28 @@ struct EngineBase
 			const precalculate& p, const vec& corner1, const vec& corner2,
 			int seed, double cache_slope, const vec& cap, unsigned* progress,
 			int tpc) = 0;
+	// parallel_mc's tasks for a ligand, appended to `chains`: one chain per
+	// task, seeded in order from `generator` (parallel_mc::operator()); with
+	// chain_split n, n chains per task with 1/n of the steps each
+	void add_chains(std::vector<ChainInput>& chains, const model& m,
+			const FlatModel& fm, int model_index, const ::parallel_mc& par,
+			rng& generator, const vec& corner1, const vec& corner2) const
+	{
+		const MCParams mp = mc_params(par.mc);
+		VINA_FOR(i, par.num_tasks * chain_split)
+		{
+			ChainInput c = make_chain(m, fm, model_index,
+					::random_int(0, 1000000, generator), corner1, corner2);
+			c.num_steps = split_steps(mp.num_steps, chain_split);
+			c.maxiters = mp.min.maxiters;
+			chains.push_back(c);
+		}
+	}
+	static unsigned split_steps(unsigned steps, int split)
+	{
+		return (steps + split - 1) / split;
+	}
+
 	// chains resident at 32 threads each (the throughput configuration)
 	size_t capacity() const
 	{
@@ -273,11 +296,8 @@ struct Engine: public EngineBase
 		DeviceModels<T> models;
 		models.upload(fms);
 
-		// parallel_mc::operator(): one task per chain, seeded in order
 		std::vector<ChainInput> chains;
-		VINA_FOR(i, par.num_tasks)
-			chains.push_back(make_chain(m, fm, 0,
-					::random_int(0, 1000000, generator), corner1, corner2));
+		add_chains(chains, m, fm, 0, par, generator, corner1, corner2);
 		MCParams prm = mc_params(par.mc);
 
 		unsigned* counter = 0;
@@ -287,8 +307,8 @@ struct Engine: public EngineBase
 			cuda_check(cudaHostAlloc((void**) &counter, sizeof(unsigned),
 					cudaHostAllocMapped), "cudaHostAlloc");
 			*counter = 0;
-			poller = new ProgressPoller(counter,
-					(unsigned long) par.num_tasks * par.mc.num_steps);
+			poller = new ProgressPoller(counter, (unsigned long) chains.size()
+					* split_steps(par.mc.num_steps, chain_split));
 		}
 		std::vector<ChainResult> results;
 		try
@@ -462,18 +482,10 @@ void Engine<T>::dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
 	std::vector<size_t> first_chain(njobs + 1, 0);
 	for (size_t j = 0; j < njobs; j++)
 	{
-		const ::parallel_mc& par = jobs[j]->par;
 		rng generator(static_cast<rng::result_type>(seed));
-		const MCParams mp = mc_params(par.mc);
 		first_chain[j] = chains.size();
-		VINA_FOR(i, par.num_tasks)
-		{
-			ChainInput c = make_chain(*jobs[j]->m, fms[j], int(j),
-					::random_int(0, 1000000, generator), corner1, corner2);
-			c.num_steps = mp.num_steps;
-			c.maxiters = mp.min.maxiters;
-			chains.push_back(c);
-		}
+		add_chains(chains, *jobs[j]->m, fms[j], int(j), jobs[j]->par, generator,
+				corner1, corner2);
 	}
 	first_chain[njobs] = chains.size();
 	const MCParams prm = mc_params(jobs[0]->par.mc);
@@ -554,6 +566,7 @@ GpuDocking::GpuDocking(const GpuSettings& s) :
 			engines.push_back(new Engine<double>(d));
 		else
 			engines.push_back(new Engine<float>(d));
+		engines.back()->chain_split = std::max(1, settings.chain_split);
 	}
 }
 
@@ -642,7 +655,7 @@ size_t GpuDocking::chains_per_batch() const
 	size_t c = 0;
 	for (size_t i = 0; i < engines.size(); i++)
 		c += engines[i]->capacity();
-	return 4 * c;
+	return std::max<size_t>(1, 4 * c / std::max(1, settings.chain_split));
 }
 
 void GpuDocking::dock_batch(std::vector<DockJob*>& jobs, const precalculate& p,
@@ -667,9 +680,10 @@ void GpuDocking::dock_batch(std::vector<DockJob*>& jobs, const precalculate& p,
 	start[nd] = jobs.size();
 
 	unsigned long total_steps = 0;
+	const int split = settings.chain_split;
 	for (size_t j = 0; j < jobs.size(); j++)
-		total_steps += (unsigned long) jobs[j]->par.num_tasks
-				* jobs[j]->par.mc.num_steps;
+		total_steps += (unsigned long) jobs[j]->par.num_tasks * split
+				* EngineBase::split_steps(jobs[j]->par.mc.num_steps, split);
 	unsigned* counter = 0;
 	ProgressPoller* poller = 0;
 	if (display_progress)

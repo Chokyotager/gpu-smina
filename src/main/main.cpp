@@ -913,6 +913,7 @@ Thank you!\n";
 		std::string builtin_scoring;
 		std::string device_list = "0";
 		int gpu_threads = 0;
+		int gpu_split = 1;
 		bool gpu_fp64 = false;
 		int gpu_ligands_per_batch = 0;
 
@@ -1055,6 +1056,8 @@ Thank you!\n";
 				("device", value<std::string>(&device_list)->default_value("0"),
 						"GPU device(s) to use, comma separated (e.g. 0,1)")
 				("gpu", bool_switch(&gpu_on), "Turn on GPU acceleration")
+				("gpu_split", value<int>(&gpu_split)->default_value(1),
+						"GPU-style search (not smina's): replace every Monte Carlo chain by this many concurrent chains with 1/N of the steps each; faster, especially for single ligands (see README.GPU.md)")
 #endif
 				;
 
@@ -1358,6 +1361,9 @@ Thank you!\n";
 			gs.devices = gpusmina::parse_devices(device_list);
 			gs.fp64 = gpu_fp64;
 			gs.threads_per_chain = gpu_threads;
+			if (gpu_split < 1)
+				throw usage_error("--gpu_split must be at least 1");
+			gs.chain_split = gpu_split;
 			gpu.reset(new gpusmina::GpuDocking(gs));
 			gpu_engine = gpu.get();
 			log << "Using " << gpu->description() << "\n";
