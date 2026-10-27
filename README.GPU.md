@@ -7,10 +7,13 @@ Metropolis acceptance, output clustering, the precalculated pair tables
 step counts, seeding and parameters are those of CPU smina. Without `--gpu`
 the program behaves exactly as before.
 
-`--gpu_split N` additionally offers a GPU-style search that is *not* smina's:
-every Monte Carlo chain is replaced by N concurrent chains with 1/N of its
-steps. It docks a single complex up to nine times faster with the same
-redocking success (see below).
+`--fast` additionally offers a GPU-style search that is *not* smina's: it
+skips local optimizations that QuickVina 2's history check deems redundant,
+splits every Monte Carlo chain into several shorter concurrent ones and, on
+screens, runs half of smina's steps. It docks a single complex 10-20 times
+faster than the 1:1 port and screens 2-4 times faster, with the same
+redocking success and screening scores as CPU smina (see below and
+[docs/fast-search.md](docs/fast-search.md)).
 
 ## Building
 
@@ -32,14 +35,16 @@ ninja -C build smina
 ```
 smina -r rec.pdb -l ligands.sdf --autobox_ligand ref.sdf --gpu -o out.sdf
 smina ... --gpu --device 0,1          # several GPUs
-smina ... --gpu --gpu_split 16        # GPU-style search (not 1:1, see below)
+smina ... --gpu --fast                # GPU-style search (not 1:1, see below)
 smina ... --minimize --gpu            # batched local optimization
 ```
 
-All other options work as usual. Hidden options (`--help_hidden`):
-`--gpu_threads` (threads per search chain; chosen automatically),
-`--gpu_batch` (ligands per batch; chosen automatically) and `--gpu_fp64`
-(double precision kernels, for validation).
+All other options work as usual. `--gpu_split N` sets `--fast`'s chain split
+by hand. Hidden options (`--help_hidden`): `--gpu_threads` (threads per
+search chain; chosen automatically), `--gpu_batch` (ligands per batch; chosen
+automatically), `--gpu_fp64` (double precision kernels, for validation), and
+`--fast`'s other components for experiments, `--gpu_qvina` (QuickVina 2's
+check) and `--gpu_budget F` (fraction of smina's steps).
 
 What runs where:
 
@@ -95,13 +100,15 @@ not depend on it.
   minimizations are bit-identical for all 1890 once the CPU cell-list quirk
   described below is excluded (`GPU_TEST_FULL_CELLS`), 1888/1890 with it.
 
-* **GPU-style search** (`--gpu_split`), the same 25 Astex complexes × 5 seeds:
-  N = 8, 16 and 32 each succeed for 91/125 (72.8%) with mean top scores
-  −9.846, −9.843 and −9.843 kcal/mol; against the CPU (92/125, −9.835), −1
-  success (permutation p = 1.00) and 0.01 kcal/mol better (p ≥ 0.25). On the
-  210-ligand screen the top scores differ from the CPU's by s.d. 0.089, 0.075
-  and 0.084 kcal/mol for N = 4, 8 and 16 (means within 0.003). Validated on
-  rigid receptors with the default scoring.
+* **`--fast`**, the same 25 Astex complexes × 5 seeds: 93/125 (74.4%), mean
+  top score −9.838 kcal/mol; against the CPU (92/125, −9.835), +1 success
+  (permutation p = 1.00) and −0.003 kcal/mol (p = 0.79). Its screening forms,
+  with half the steps, redock within noise as well: split 8, 90/125 (p = 0.62;
+  +0.010 kcal/mol, p = 0.39); split 16, 92/125 (+0.024, p = 0.13). On the
+  210-ligand screen (split 4 on one GPU, 8 on two), top scores differ from the
+  CPU's by s.d. 0.083 (one GPU) and 0.081 kcal/mol (two GPUs), means within
+  0.002; two CPU runs with different seeds differ by 0.073. Validated with
+  rigid receptors and the default scoring function.
 
 Tools: `src/gpu/tests/gpu_eval_test` (grids and evaluations),
 `src/gpu/tests/gpu_mc_test` (trajectories, `--minimize`, determinism,
@@ -119,15 +126,15 @@ Ryzen 9 5950X (16 cores, 32 threads); RTX 4080 SUPER and RTX 4070 Ti SUPER;
 CPU smina built from this tree (`-O3`, same compiler); idle machine, wall
 clock times including input and output.
 
-| workload | CPU smina | `--gpu` (1:1) | `--gpu --gpu_split N` |
+| workload | CPU smina | `--gpu` (1:1) | `--gpu --fast` |
 |---|---|---|---|
-| 1HSG redocking, exhaustiveness 8 | 43 s (`--cpu 8`) | 26 s | 6.4 s (N = 8), 4.2 s (16), 2.9 s (32) |
-| … exhaustiveness 32 | 58 s (`--cpu 32`) | 44 s | |
-| … exhaustiveness 128 | 173 s (`--cpu 32`) | 47 s | |
-| Astex set, exhaustiveness 8, per complex | | 16.8 s | 3.6 s (8), 2.7 s (16), 2.1 s (32) |
-| 1HSG, flexible residues A:50 and B:50, exhaustiveness 8 | 41 s (`--cpu 8`) | 48 s | |
-| screening 210 ligands (1HSG box, exhaustiveness 8): one GPU / both | 236 s (32 single-threaded processes) | 32 s / 19.5 s | 18.5 s / 12.4 s (N = 8) |
-| screening 840 ligands (the 210, four times): one GPU / both | not measured | 57 s / 47 s | 62 s / 37 s (N = 4) |
+| 1HSG redocking, exhaustiveness 8 | 43 s (`--cpu 8`) | 26 s | 1.2 s |
+| … exhaustiveness 32 | 58 s (`--cpu 32`) | 44 s | 2.5 s |
+| … exhaustiveness 128 | 173 s (`--cpu 32`) | 47 s | 5.7 s |
+| Astex set, exhaustiveness 8, per complex | | 16.8 s | 1.5 s |
+| 1HSG, flexible residues A:50 and B:50, exhaustiveness 8 | 41 s (`--cpu 8`) | 48 s | 1.2 s (not validated) |
+| screening 210 ligands (1HSG box, exhaustiveness 8): one GPU / both | 236 s (32 single-threaded processes) | 32 s / 19.5 s | 7.9 s / 5.4 s |
+| screening 840 ligands (the 210, four times): one GPU / both | not measured | 57 s / 47 s | 28.6 s / 16.9 s |
 | `--minimize`, 1890 docked poses | 0.47 s (32 processes), 4.8 s (1 process) | 2.3 s | |
 | `--minimize`, 1890 random poses | 4.4 s (32 processes), 49 s (1 process) | 13 s | |
 
@@ -158,15 +165,19 @@ Giving the remaining chains more threads as others finish (chains can stop and
 resume exactly) did not do better: the boundaries are barriers held by the
 slowest chain, whose excess work no estimate made in advance predicts.
 
-`--gpu_split N` attacks both problems: N times as many chains fill the GPU for
-a single complex, and N times shorter chains shorten a screen's tail. It pays
-off where the GPU would otherwise idle — single complexes (6 times faster at N
-= 16, 9 times at N = 32) and small screens (1.7 times on one GPU, 1.6 times on
-two at N = 8). The shorter chains need more evaluations for the same number of
-steps (19% more at N = 8: more of each chain is spent descending from its
-random start), so a screen that already keeps one GPU busy gains nothing (840
-ligands: 57 s at N = 1, 62 s at N = 4); on two GPUs, N = 4 still helps (47 s →
-37 s).
+`--fast` attacks both problems, and the search's redundancy. QuickVina 2's
+history check skips local optimizations whose starting point the chain's
+recent history says will fall back into a known minimum (about 2× on its own:
+Astex 16.8 s → 8.5 s). Splitting every chain into several shorter ones fills
+the GPU for a single complex and shortens a screen's tail; the split is
+chosen per batch, the largest power of two from 4 to 32 that keeps a GPU's
+chains within 4 waves (32 for a single complex, 4 or 8 for the screens
+above), because shorter chains need more evaluations for the same steps.
+Once the GPU is full (split below 32), half of smina's steps are run, which
+halves a screen's time; a single complex's run is mostly fixed overhead, so
+it keeps the full budget. Budgets below half, and the budgets of Uni-Dock
+(about 1-8% of smina's steps), cost redocking success and top scores.
+[docs/fast-search.md](docs/fast-search.md) has the measurements.
 
 `--minimize` gains nothing over a multi-core CPU. Minimizing a docked pose
 costs about 2 ms of CPU time; the GPU does all 1890 in 0.14 s, but the rest of
