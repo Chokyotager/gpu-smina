@@ -36,6 +36,9 @@ struct ChainOffsets
 	int tmp, cand, coords; // current conf, candidate, heavy atom coords
 	int x_new, x_orig, g, g_new, g_orig, p, y, minus_hy, h; // bfgs
 	int out_conf, out_e, out_coords; // output container storage
+	// a chain stopped between steps: current energy, best energy, and the
+	// model state mutation reads (atom coordinates, frame origins)
+	int resume_e, resume_coords, resume_origins;
 	int total;
 	// int block: sorted order of the output storage, then its size
 	int order, count, int_total;
@@ -71,7 +74,7 @@ struct ChainView
 };
 
 inline ChainOffsets chain_layout(int conf_size, int change_size, int num_heavy,
-		int num_saved)
+		int num_saved, int num_movable = 0, int num_frames = 0)
 {
 	ChainOffsets o;
 	int at = 0;
@@ -105,6 +108,12 @@ inline ChainOffsets chain_layout(int conf_size, int change_size, int num_heavy,
 	at += num_saved;
 	o.out_coords = at;
 	at += num_saved * 3 * num_heavy;
+	o.resume_e = at;
+	at += 2;
+	o.resume_coords = at;
+	at += 3 * num_movable;
+	o.resume_origins = at;
+	at += 3 * num_frames;
 	o.total = at;
 	o.order = 0;
 	o.count = num_saved;

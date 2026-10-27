@@ -117,14 +117,26 @@ struct EngineBase
 	virtual void minimize_batch(GpuDocking::MinimizeJob* jobs, size_t njobs,
 			const precalculate& p, const vec& cap, const grid& user_grid,
 			int tpc) = 0;
-	virtual void dock_batch(GpuDocking::DockJob* const* jobs, size_t njobs,
-			const precalculate& p, const grid_dims& gd, const vec& corner1,
-			const vec& corner2, int seed, const grid& user_grid,
-			double cache_slope, const vec& cap, unsigned* progress, int tpc) = 0;
+	// the receptor's data and grid maps for every atom type of `jobs`
+	virtual void prepare_docking(GpuDocking::DockJob* const* jobs, size_t njobs,
+			const precalculate& p, const grid_dims& gd, const grid& user_grid,
+			double cache_slope) = 0;
+	// search and refinement of `jobs` (after prepare_docking); threads per
+	// chain follow mc_phases for `sched_threads` resident threads
+	virtual void dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
+			const precalculate& p, const vec& corner1, const vec& corner2,
+			int seed, double cache_slope, const vec& cap, unsigned* progress,
+			int tpc, size_t sched_threads) = 0;
 	// concurrently resident chains (32 threads each)
 	size_t capacity() const
 	{
 		return size_t(sm_count) * 3 * 8;
+	}
+
+	// threads the device keeps resident (3 blocks of 256 per SM)
+	size_t resident_threads() const
+	{
+		return size_t(sm_count) * 768;
 	}
 
 	// While every item fits on the GPU at once, a launch takes as long as
@@ -132,9 +144,12 @@ struct EngineBase
 	// resident; beyond that, 32 threads per item give the best throughput.
 	int choose_tpc(int requested, size_t items) const
 	{
+		return choose_tpc(requested, items, resident_threads());
+	}
+	static int choose_tpc(int requested, size_t items, size_t resident_threads)
+	{
 		if (requested > 0)
 			return requested;
-		const size_t resident_threads = size_t(sm_count) * 768;
 		const int options[3] = {256, 128, 64};
 		for (int i = 0; i < 3; i++)
 			if (items * options[i] <= resident_threads)
@@ -166,6 +181,8 @@ struct Engine: public EngineBase
 			EngineBase(d), tables_key(0), have_receptor(false), have_box(false),
 					grids(0), grids_slope(0), user_grid_key(0)
 	{
+		cuda_check(cudaSetDevice(device), "cudaSetDevice");
+		preload_kernels<T>();
 	}
 	~Engine()
 	{
@@ -291,7 +308,7 @@ struct Engine: public EngineBase
 		try
 		{
 			run_monte_carlo(models, tables, context(true, cache_slope), prm,
-					chains, results, counter, choose_tpc(tpc, chains.size()));
+					chains, results, counter, tpc, resident_threads());
 		} catch (...)
 		{
 			delete poller;
@@ -316,10 +333,29 @@ struct Engine: public EngineBase
 		out.sort();
 	}
 
-	void dock_batch(GpuDocking::DockJob* const* jobs, size_t njobs,
-			const precalculate& p, const grid_dims& gd, const vec& corner1,
-			const vec& corner2, int seed, const grid& ug, double cache_slope,
-			const vec& cap, unsigned* progress, int tpc);
+	void prepare_docking(GpuDocking::DockJob* const* jobs, size_t njobs,
+			const precalculate& p, const grid_dims& gd, const grid& ug,
+			double cache_slope)
+	{
+		if (njobs == 0)
+			return;
+		cuda_check(cudaSetDevice(device), "cudaSetDevice");
+		ensure_tables(p);
+		ensure_user_grid(ug);
+		ensure_box(*jobs[0]->m, gd, p.cutoff_sqr());
+		std::vector<int> types;
+		for (size_t j = 0; j < njobs; j++)
+		{
+			std::vector<smt> t;
+			jobs[j]->m->get_movable_atom_types(t);
+			types.insert(types.end(), t.begin(), t.end());
+		}
+		ensure_grids(*jobs[0]->m, types, cache_slope);
+	}
+	void dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
+			const precalculate& p, const vec& corner1, const vec& corner2,
+			int seed, double cache_slope, const vec& cap, unsigned* progress,
+			int tpc, size_t sched_threads);
 
 	void minimize_batch(GpuDocking::MinimizeJob* jobs, size_t njobs,
 			const precalculate& p, const vec& cap, const grid& ug, int tpc)
@@ -416,25 +452,14 @@ struct Engine: public EngineBase
 };
 
 template<typename T>
-void Engine<T>::dock_batch(GpuDocking::DockJob* const* jobs, size_t njobs,
-		const precalculate& p, const grid_dims& gd, const vec& corner1,
-		const vec& corner2, int seed, const grid& ug, double cache_slope,
-		const vec& cap, unsigned* progress, int tpc)
+void Engine<T>::dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
+		const precalculate& p, const vec& corner1, const vec& corner2, int seed,
+		double cache_slope, const vec& cap, unsigned* progress, int tpc,
+		size_t sched_threads)
 {
 	if (njobs == 0)
 		return;
 	cuda_check(cudaSetDevice(device), "cudaSetDevice");
-	ensure_tables(p);
-	ensure_user_grid(ug);
-	ensure_box(*jobs[0]->m, gd, p.cutoff_sqr());
-	std::vector<int> types;
-	for (size_t j = 0; j < njobs; j++)
-	{
-		std::vector<smt> t;
-		jobs[j]->m->get_movable_atom_types(t);
-		types.insert(types.end(), t.begin(), t.end());
-	}
-	ensure_grids(*jobs[0]->m, types, cache_slope);
 
 	std::vector<FlatModel> fms(njobs);
 	std::vector<const FlatModel*> fmp(njobs);
@@ -469,7 +494,7 @@ void Engine<T>::dock_batch(GpuDocking::DockJob* const* jobs, size_t njobs,
 	const MCParams prm = mc_params(jobs[0]->par.mc);
 	std::vector<ChainResult> results;
 	run_monte_carlo(models, tables, context(true, cache_slope), prm, chains,
-			results, progress, choose_tpc(tpc, chains.size()));
+			results, progress, tpc, sched_threads);
 
 	// merge_output_containers per ligand
 	std::vector<output_type*> poses;
@@ -507,7 +532,7 @@ void Engine<T>::dock_batch(GpuDocking::DockJob* const* jobs, size_t njobs,
 	const double v[3] = {cap[0], cap[1], cap[2]};
 	bool ok = run_refine(models, tables, context(false, 0),
 			min_params(jobs[0]->par.mc.ssd_par.minparm), v, pose_model, confs, e,
-			coords, choose_tpc(tpc, poses.size()), pose_maxiters);
+			coords, choose_tpc(tpc, poses.size(), sched_threads), pose_maxiters);
 	if (!ok)
 		throw std::runtime_error(
 				"Ligand atom exactly overlaps receptor atom.  I can't deal with this.");
@@ -686,8 +711,9 @@ void GpuDocking::dock_batch(std::vector<DockJob*>& jobs, const precalculate& p,
 		{
 			try
 			{
-				e->dock_batch(first, n, p, gd, corner1, corner2, seed, user_grid,
-						cache_slope, cap, counter, tpc);
+				e->prepare_docking(first, n, p, gd, user_grid, cache_slope);
+				e->dock_sub(first, n, p, corner1, corner2, seed, cache_slope, cap,
+						counter, tpc, e->resident_threads());
 			} catch (std::exception& ex)
 			{
 				*err = ex.what();

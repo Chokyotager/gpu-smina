@@ -590,12 +590,14 @@ template<typename T> __device__ bool metropolis_accept(T old_f, T new_f,
 	return random_fl(0, 1, rng) < acceptance_probability;
 }
 
-// monte_carlo::operator() for one chain; the chain's initial conf (already
-// randomized on the host) is in cv.tmp
+// monte_carlo::operator() for one chain, steps [start, prm.num_steps); the
+// chain's conf is in cv.tmp (at step 0, randomized on the host), its current
+// and best energies in tmp_e and best_e
 template<typename T, bool ORDERED, int TPC> __device__ void monte_carlo_chain(
 		const ModelView<T>& mv, const DevTables<T>& tb,
 		const InterContext<T>& ic, const MCParams& prm, const ChainView<T>& cv,
-		EvalScratch<T>& ws, MTState& rng, const Group<TPC>& G, unsigned* progress)
+		EvalScratch<T>& ws, MTState& rng, const Group<TPC>& G, unsigned* progress,
+		unsigned start, T& tmp_e, T& best_e)
 {
 	const T hunt_cap[3] = {T(prm.hunt_cap[0]), T(prm.hunt_cap[1]),
 			T(prm.hunt_cap[2])};
@@ -606,13 +608,11 @@ template<typename T, bool ORDERED, int TPC> __device__ void monte_carlo_chain(
 	const int csz = mv.d.conf_size;
 
 	PROF_START(tmc);
-	T tmp_e = 0;
-	T best_e = max_value<T>();
-	if (G.rank == 0)
+	if (start == 0 && G.rank == 0)
 		*cv.count = 0;
 	G.sync();
 
-	for (unsigned step = 0; step < prm.num_steps; step++)
+	for (unsigned step = start; step < prm.num_steps; step++)
 	{
 		if (progress && G.rank == 0)
 			atomicAdd(progress, 1u);

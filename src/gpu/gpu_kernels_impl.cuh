@@ -21,6 +21,9 @@
 #include <cuda_runtime.h>
 #include <type_traits>
 #include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 
@@ -305,7 +308,7 @@ static void launch_eval_confs(const DeviceModels<T>& models, int nconf,
 			T(v[1]), T(v[2]), dconfs.get<T>(), de.get<T>(), dg.get<T>(),
 			dcoords ? dcoords->get<T>() : (T*) 0, gs, so, derr.get<int>());
 	cuda_check(cudaGetLastError(), "eval_confs_kernel launch");
-	cuda_check(cudaDeviceSynchronize(), "eval_confs_kernel");
+	cuda_check(cudaStreamSynchronize(cudaStreamPerThread), "eval_confs_kernel");
 }
 
 template<typename T>
@@ -436,43 +439,76 @@ __global__ void __launch_bounds__(BLOCK_THREADS, MinBlocks<TPC>::value) monte_ca
 		int* chain_imem, const __grid_constant__ ChainOffsets co,
 		const __grid_constant__ GlobalScratch<T> gs,
 		const __grid_constant__ ScratchOffsets so, int* error,
-		unsigned* progress, const uint2* chain_limits)
+		unsigned* progress, const uint4* chain_limits, const int* item_chain)
 {
 	Group<TPC> G;
-	int chain;
+	int item;
 	ModelView<T>* mvp;
 	GroupDesc<T>* gd;
-	if (!block_setup(dm, tasks, plan, so, gs, error, G, chain, mvp, gd))
+	if (!block_setup(dm, tasks, plan, so, gs, error, G, item, mvp, gd))
 		return;
+	const int chain = item_chain[item];
 	const ModelView<T>& mv = *mvp;
 	setup_chain(gd, plan, so, co, chain_mem, chain_imem, chain, G);
 	if (plan.hot_shared)
 		copy_n(gd->cv.tmp, gd->mem + co.tmp, mv.d.conf_size, G);
-	// the task's model starts in the parsed (input) state
-	const T* ic0 = dm.init_coords + 3 * mv.d.atom_offset;
-	for (int i = G.rank; i < 3 * mv.d.num_movable; i += TPC)
-		gd->ws.coords[i] = ic0[i];
-	const T* fo0 = dm.init_frame_origin + 3 * mv.d.frame_offset;
-	for (int i = G.rank; i < 3 * mv.d.num_frames; i += TPC)
-		gd->ws.frame_origin[i] = fo0[i];
+	// limits: steps [x, y), bfgs iterations z
+	const uint4 lim = chain_limits[chain];
+	const int nc = 3 * mv.d.num_movable, nf = 3 * mv.d.num_frames;
+	T tmp_e = 0;
+	T best_e = max_value<T>();
+	if (lim.x == 0)
+	{
+		// the task's model starts in the parsed (input) state
+		const T* ic0 = dm.init_coords + 3 * mv.d.atom_offset;
+		for (int i = G.rank; i < nc; i += TPC)
+			gd->ws.coords[i] = ic0[i];
+		const T* fo0 = dm.init_frame_origin + 3 * mv.d.frame_offset;
+		for (int i = G.rank; i < nf; i += TPC)
+			gd->ws.frame_origin[i] = fo0[i];
+	}
+	else
+	{
+		// resumed: the state the previous launch stopped in
+		copy_n(gd->ws.coords, gd->mem + co.resume_coords, nc, G);
+		copy_n(gd->ws.frame_origin, gd->mem + co.resume_origins, nf, G);
+		tmp_e = gd->mem[co.resume_e];
+		best_e = gd->mem[co.resume_e + 1];
+	}
 	G.sync();
 	if (g_chain_stats && G.rank == 0)
 	{
 		unsigned long long t;
 		asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-		g_chain_stats[4 * chain + 3] = t;
+		if (lim.x == 0)
+			g_chain_stats[4 * chain + 3] = t;
+		g_group_evals[blockIdx.x * (blockDim.x / TPC) + G.gid] = 0;
 	}
 	MCParams p = prm;
-	p.num_steps = chain_limits[chain].x;
-	p.min.maxiters = chain_limits[chain].y;
+	p.num_steps = lim.y;
+	p.min.maxiters = lim.z;
 	monte_carlo_chain<T, Ordered<T>::value>(mv, tb, ic, p, gd->cv, gd->ws,
-			rngs[chain], G, progress);
+			rngs[chain], G, progress, lim.x, tmp_e, best_e);
+	if (lim.w)
+	{
+		// more steps follow in a later launch
+		if (plan.hot_shared)
+			copy_n(gd->mem + co.tmp, gd->cv.tmp, mv.d.conf_size, G);
+		copy_n(gd->mem + co.resume_coords, gd->ws.coords, nc, G);
+		copy_n(gd->mem + co.resume_origins, gd->ws.frame_origin, nf, G);
+		if (G.rank == 0)
+		{
+			gd->mem[co.resume_e] = tmp_e;
+			gd->mem[co.resume_e + 1] = best_e;
+		}
+		G.sync();
+	}
 	if (g_chain_stats && G.rank == 0)
 	{
 		unsigned long long t;
 		asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
 		g_chain_stats[4 * chain] = t;
-		g_chain_stats[4 * chain + 1] =
+		g_chain_stats[4 * chain + 1] +=
 				g_group_evals[blockIdx.x * (blockDim.x / TPC) + G.gid];
 		g_chain_stats[4 * chain + 2] = blockIdx.x;
 	}
@@ -484,7 +520,7 @@ static void launch_monte_carlo(const DeviceModels<T>& models,
 		const InterContext<T>& ic, const MCParams& params,
 		const ScratchOffsets& so, const ChainOffsets& co, DevBuf& drng,
 		DevBuf& dmem, DevBuf& dimem, DevBuf& derr, unsigned* dprogress,
-		DevBuf& dlimits, const std::vector<double>& cost)
+		DevBuf& dlimits, DevBuf& ditems, const std::vector<double>& cost)
 {
 	std::vector<BlockTask> tasks = make_tasks(cmodel, BLOCK_THREADS / TPC);
 	order_by_cost(tasks, cost);
@@ -498,9 +534,93 @@ static void launch_monte_carlo(const DeviceModels<T>& models,
 	monte_carlo_kernel<T, TPC><<<int(tasks.size()), BLOCK_THREADS, plan.total>>>(
 			models.dev, dtasks.get<BlockTask>(), plan, tables.dev, ic, params,
 			drng.get<MTState>(), dmem.get<T>(), dimem.get<int>(), co, gs, so,
-			derr.get<int>(), dprogress, dlimits.get<uint2>());
+			derr.get<int>(), dprogress, dlimits.get<uint4>(), ditems.get<int>());
 	cuda_check(cudaGetLastError(), "monte_carlo_kernel launch");
-	cuda_check(cudaDeviceSynchronize(), "monte_carlo_kernel");
+	cuda_check(cudaStreamSynchronize(cudaStreamPerThread), "monte_carlo_kernel");
+}
+
+// Threads per chain over a search: chains run concurrently and finish at
+// different times (their work differs severalfold), so a single launch
+// spends its end with a few long chains on an otherwise idle device.
+// Phases relaunch the remaining chains with more threads each: phase k ends
+// where the estimated work of a chain reaches limit; the next phase uses the
+// most threads per chain that keep every remaining chain resident (the
+// residency rule of the first launch).  The schedule depends only on the
+// chains' estimated work, so results are reproducible.  (Work per chain also
+// varies with the trajectory, up to threefold between chains of one ligand,
+// which no estimate predicts: the slowest chain still sets the end.)
+//
+// threads_per_chain > 0: that many, one phase.  GPU_TEST_SLICES=n splits
+// the search into n phases of equal work alternating 32 and 256 threads per
+// chain (GPU_TEST_SLICES_TPC: one fixed value), to test resumption.
+struct MCPhase
+{
+	double limit; // work at which the phase ends (last phase: unused)
+	int tpc;
+};
+
+static std::vector<MCPhase> mc_phases(const std::vector<double>& work,
+		int threads_per_chain, size_t resident_threads)
+{
+	std::vector<MCPhase> phases;
+	const double max_work = *std::max_element(work.begin(), work.end());
+	if (const char* env = getenv("GPU_TEST_SLICES"))
+	{
+		const int n = std::max(1, atoi(env));
+		const char* fixed = getenv("GPU_TEST_SLICES_TPC");
+		for (int k = 0; k < n; k++)
+		{
+			MCPhase p = {max_work * (k + 1) / n, fixed ? atoi(fixed)
+					: (k % 2 ? 256 : 32)};
+			phases.push_back(p);
+		}
+		return phases;
+	}
+	// Boundaries are barriers, which the chain slowest to reach one (a
+	// trajectory needing more evaluations than estimated) holds for all.
+	// Measured on screens, raising 32 threads per chain pays for that, but
+	// raising 64 does not; and with more chains than stay resident, chains
+	// of the first blocks would wait for blocks that started later.  So
+	// phases are used only for a single resident wave at 32 threads per
+	// chain.
+	const int options[4] = {32, 64, 128, 256};
+	const size_t n = work.size();
+	// the residency rule: the most threads per chain that keep every chain
+	// resident, else 32
+	int first = 0;
+	for (int i = 3; i > 0; i--)
+		if (n * options[i] <= resident_threads)
+		{
+			first = i;
+			break;
+		}
+	if (threads_per_chain > 0 || first > 0 || n * 32 > resident_threads)
+	{
+		MCPhase p = {max_work, threads_per_chain > 0 ? threads_per_chain
+				: options[first]};
+		phases.push_back(p);
+		return phases;
+	}
+	std::vector<double> desc(work);
+	std::sort(desc.begin(), desc.end(), std::greater<double>());
+	MCPhase p = {max_work, options[first]};
+	phases.push_back(p);
+	for (int i = first + 1; i < 4; i++)
+	{
+		// beyond work `limit` at most resident_threads / tpc chains remain
+		const double limit = desc[resident_threads / options[i]];
+		const double start = phases.size() > 1 ? phases[phases.size() - 2].limit
+				: 0;
+		if (limit <= start)
+			phases.back().tpc = options[i]; // already few enough
+		else
+		{
+			phases.back().limit = limit;
+			MCPhase next = {max_work, options[i]};
+			phases.push_back(next);
+		}
+	}
+	return phases;
 }
 
 template<typename T>
@@ -508,7 +628,7 @@ void run_monte_carlo(const DeviceModels<T>& models,
 		const DeviceTables<T>& tables, const InterContext<T>& ic,
 		const MCParams& params, const std::vector<ChainInput>& chains,
 		std::vector<ChainResult>& results, unsigned* progress,
-		int threads_per_chain)
+		int threads_per_chain, size_t resident_threads)
 {
 	const int nchains = int(chains.size());
 	results.assign(nchains, ChainResult());
@@ -517,29 +637,38 @@ void run_monte_carlo(const DeviceModels<T>& models,
 	ScratchOffsets so = scratch_layout(models.max_movable, models.max_frames,
 			models.max_list, models.max_pairs, Ordered<T>::value);
 	ChainOffsets co = chain_layout(models.max_conf, models.max_change,
-			models.max_heavy, params.num_saved_mins);
+			models.max_heavy, params.num_saved_mins, models.max_movable,
+			models.max_frames);
 
 	std::vector<int> cmodel(nchains);
 	std::vector<MTState> rng(nchains);
-	std::vector<uint2> limits(nchains);
-	std::vector<double> cost(nchains);
+	std::vector<unsigned> steps(nchains), maxiters(nchains);
+	std::vector<double> step_cost(nchains), work(nchains);
 	std::vector<T> mem(size_t(nchains) * co.total, T(0));
 	for (int c = 0; c < nchains; c++)
 	{
 		cmodel[c] = chains[c].model;
 		rng[c] = chains[c].rng;
-		limits[c].x = chains[c].num_steps ? chains[c].num_steps
-				: params.num_steps;
-		limits[c].y = chains[c].maxiters ? chains[c].maxiters
+		steps[c] = chains[c].num_steps ? chains[c].num_steps : params.num_steps;
+		maxiters[c] = chains[c].maxiters ? chains[c].maxiters
 				: params.min.maxiters;
-		cost[c] = double(limits[c].x) * limits[c].y
-				* eval_cost(models.host_desc[cmodel[c]]);
+		step_cost[c] = double(maxiters[c]) * eval_cost(models.host_desc[cmodel[c]]);
+		work[c] = steps[c] * step_cost[c];
 		for (size_t i = 0; i < chains[c].conf.size(); i++)
 			mem[size_t(c) * co.total + co.tmp + i] = T(chains[c].conf[i]);
 	}
-	DevBuf drng, dmem, dimem, derr, dlimits;
+	const std::vector<MCPhase> phases = mc_phases(work, threads_per_chain,
+			resident_threads);
+	if (getenv("GPU_CHAIN_STATS"))
+	{
+		fprintf(stderr, "%d chains, phases:", nchains);
+		for (size_t k = 0; k < phases.size(); k++)
+			fprintf(stderr, " [to %.3g: %d threads]", phases[k].limit,
+					phases[k].tpc);
+		fprintf(stderr, "\n");
+	}
+	DevBuf drng, dmem, dimem, derr, dlimits, ditems;
 	drng.upload(&rng[0], sizeof(MTState) * nchains);
-	dlimits.upload(&limits[0], sizeof(uint2) * nchains);
 	dmem.upload(&mem[0], sizeof(T) * mem.size());
 	dimem.alloc(sizeof(int) * size_t(nchains) * co.int_total);
 	dimem.zero();
@@ -552,6 +681,7 @@ void run_monte_carlo(const DeviceModels<T>& models,
 	if (chain_stats)
 	{
 		dstats.alloc(sizeof(unsigned long long) * 4 * nchains);
+		dstats.zero();
 		dgroup.alloc(sizeof(unsigned long long) * 8 * nchains + 4096);
 		dgroup.zero();
 		unsigned long long* ps = dstats.get<unsigned long long>();
@@ -565,18 +695,52 @@ void run_monte_carlo(const DeviceModels<T>& models,
 		cuda_check(cudaHostGetDevicePointer((void**) &dprogress, progress, 0),
 				"progress pointer");
 
-	if (threads_per_chain >= 256)
-		launch_monte_carlo<T, 256>(models, cmodel, tables, ic, params, so, co,
-				drng, dmem, dimem, derr, dprogress, dlimits, cost);
-	else if (threads_per_chain >= 128)
-		launch_monte_carlo<T, 128>(models, cmodel, tables, ic, params, so, co,
-				drng, dmem, dimem, derr, dprogress, dlimits, cost);
-	else if (threads_per_chain >= 64)
-		launch_monte_carlo<T, 64>(models, cmodel, tables, ic, params, so, co,
-				drng, dmem, dimem, derr, dprogress, dlimits, cost);
-	else
-		launch_monte_carlo<T, 32>(models, cmodel, tables, ic, params, so, co,
-				drng, dmem, dimem, derr, dprogress, dlimits, cost);
+	// every phase resumes the unfinished chains where the previous one
+	// stopped: phase k runs chain c up to the first step at which its
+	// estimated work reaches phases[k].limit
+	std::vector<unsigned> done(nchains, 0);
+	std::vector<uint4> limits(nchains);
+	for (size_t ph = 0; ph < phases.size(); ph++)
+	{
+		std::vector<int> items, item_model;
+		std::vector<double> cost;
+		for (int c = 0; c < nchains; c++)
+		{
+			unsigned end = steps[c];
+			if (ph + 1 < phases.size())
+				end = unsigned(std::min<double>(steps[c],
+						std::ceil(phases[ph].limit / step_cost[c])));
+			if (end <= done[c])
+				continue;
+			limits[c] = make_uint4(done[c], end, maxiters[c], end < steps[c]);
+			done[c] = end;
+			items.push_back(c);
+			item_model.push_back(cmodel[c]);
+			cost.push_back((limits[c].y - limits[c].x) * step_cost[c]);
+		}
+		if (items.empty())
+			continue;
+		dlimits.upload(&limits[0], sizeof(uint4) * nchains);
+		ditems.upload(&items[0], sizeof(int) * items.size());
+		const int tpc = phases[ph].tpc;
+		const auto phase_t0 = std::chrono::steady_clock::now();
+		if (tpc >= 256)
+			launch_monte_carlo<T, 256>(models, item_model, tables, ic, params, so,
+					co, drng, dmem, dimem, derr, dprogress, dlimits, ditems, cost);
+		else if (tpc >= 128)
+			launch_monte_carlo<T, 128>(models, item_model, tables, ic, params, so,
+					co, drng, dmem, dimem, derr, dprogress, dlimits, ditems, cost);
+		else if (tpc >= 64)
+			launch_monte_carlo<T, 64>(models, item_model, tables, ic, params, so,
+					co, drng, dmem, dimem, derr, dprogress, dlimits, ditems, cost);
+		else
+			launch_monte_carlo<T, 32>(models, item_model, tables, ic, params, so,
+					co, drng, dmem, dimem, derr, dprogress, dlimits, ditems, cost);
+		if (getenv("GPU_CHAIN_STATS"))
+			fprintf(stderr, "phase %d: %zu chains, %d threads, %.2f s\n", int(ph),
+					items.size(), tpc, std::chrono::duration<double>(
+							std::chrono::steady_clock::now() - phase_t0).count());
+	}
 #ifdef GPU_PROFILE
 	report_profile();
 #endif
@@ -745,7 +909,7 @@ static void launch_bfgs(const DeviceModels<T>& models,
 			derr.get<int>(), de.get<T>(), refine, dcoords.get<T>(),
 			models.max_heavy, dmaxiters, dboxes, ditem_end);
 	cuda_check(cudaGetLastError(), "bfgs_kernel launch");
-	cuda_check(cudaDeviceSynchronize(), "bfgs_kernel");
+	cuda_check(cudaStreamSynchronize(cudaStreamPerThread), "bfgs_kernel");
 }
 
 template<typename T>
@@ -872,6 +1036,27 @@ bool run_refine(const DeviceModels<T>& models, const DeviceTables<T>& tables,
 			threads_per_chain, 1, &coords, maxiters, boxes);
 }
 
+// CUDA loads kernels lazily on their first launch, and loading waits for
+// the device's running kernels: load them all before work starts, so that
+// host threads sharing a device do not stall each other.
+template<typename T, int TPC> static void preload_tpc()
+{
+	cudaFuncAttributes a;
+	cuda_check(cudaFuncGetAttributes(&a, eval_confs_kernel<T, TPC>), "preload");
+	cuda_check(cudaFuncGetAttributes(&a, monte_carlo_kernel<T, TPC>), "preload");
+	cuda_check(cudaFuncGetAttributes(&a, bfgs_kernel<T, TPC>), "preload");
+}
+
+template<typename T>
+void preload_kernels()
+{
+	preload_tpc<T, 32>();
+	preload_tpc<T, 64>();
+	preload_tpc<T, 128>();
+	preload_tpc<T, 256>();
+}
+
+template void preload_kernels<GPU_PRECISION>();
 template bool eval_confs<GPU_PRECISION>(const DeviceModels<GPU_PRECISION>&,
 		int, const DeviceTables<GPU_PRECISION>&,
 		const InterContext<GPU_PRECISION>&, const double[3],
@@ -881,7 +1066,7 @@ template void run_monte_carlo<GPU_PRECISION>(
 		const DeviceModels<GPU_PRECISION>&, const DeviceTables<GPU_PRECISION>&,
 		const InterContext<GPU_PRECISION>&, const MCParams&,
 		const std::vector<ChainInput>&, std::vector<ChainResult>&, unsigned*,
-		int);
+		int, size_t);
 template bool run_bfgs<GPU_PRECISION>(const DeviceModels<GPU_PRECISION>&,
 		const DeviceTables<GPU_PRECISION>&, const InterContext<GPU_PRECISION>&,
 		const MinParams&, const double[3], const std::vector<int>&,

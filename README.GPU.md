@@ -51,7 +51,11 @@ With `--gpu`, ligands are docked in batches large enough to fill all GPUs
 (the search chains of every ligand in a batch run concurrently); each ligand is
 then finished and written in input order. A ligand's chains are seeded exactly
 as on the CPU (a fresh generator from `--seed` per ligand, tasks seeded from
-it in order), so results do not depend on batch composition.
+it in order). Results are reproducible for the same input and GPUs. In single
+precision they can differ (statistically equivalently) between batch sizes or
+GPU sets, because the number of threads per chain depends on how many chains
+share a GPU and changes the rounding of sums; the double precision kernels do
+not depend on it.
 
 ## Validation
 
@@ -105,17 +109,34 @@ clock times including input and output.
 | … exhaustiveness 32 | 58 s (`--cpu 32`) | 47 s |
 | … exhaustiveness 128 | 173 s (`--cpu 32`) | 64 s |
 | 1HSG, flexible residues A:50 and B:50, exhaustiveness 8 | 41 s (`--cpu 8`) | 48 s |
-| screening 210 ligands (1HSG box, exhaustiveness 8) | 236 s (32 single-threaded processes) | 42 s (RTX 4080 SUPER), 25 s (both GPUs) |
+| screening 210 ligands (1HSG box, exhaustiveness 8) | 236 s (32 single-threaded processes) | 35 s (RTX 4080 SUPER), 25 s (both GPUs) |
+| screening 840 ligands (the 210, four times) | not measured | 75 s (RTX 4080 SUPER) |
 | `--minimize`, 1890 docked poses | 0.47 s (32 processes), 4.8 s (1 process) | 2.3 s |
 | `--minimize`, 1890 random poses | 4.4 s (32 processes), 49 s (1 process) | 13 s |
 
-Single-complex runs used one GPU (the default, device 0).
+Single-complex runs used one GPU (the default, device 0). Times are single
+runs (screens: mean of 4 seeds); a run takes as long as its slowest search
+chain, and single precision trajectories differ between seeds, so times vary
+by about ±10%.
 
 The search is a set of independent but internally sequential Monte Carlo
 chains (exhaustiveness 8 means 8 chains of tens of thousands of steps). A
 single ligand at the default exhaustiveness therefore keeps only a few
 streaming multiprocessors busy and gains little; the GPU pays off when many
 chains run at once — many ligands, or higher exhaustiveness.
+
+A screen ends with its longest chains. Chains differ severalfold in work (the
+number of steps grows with the ligand's size and flexibility, and the number
+of evaluations per step varies with the trajectory, up to threefold between
+chains of the same ligand), so near the end of a batch most of the GPU idles.
+When a batch is a single wave of chains at 32 threads per chain, the search
+runs in phases that give the remaining chains 64, 128 and then 256 threads
+each as the others finish (chains resume exactly where they stopped; the
+phase boundaries depend only on the chains' estimated work, so results stay
+reproducible): 210 ligands on one GPU take 35 s instead of 41 s. The 840-ligand
+screen reaches about 77% of the GPU's throughput, the 210-ligand one about
+40%; the rest is the tail of trajectories that need far more evaluations than
+estimated, which no schedule fixed in advance can anticipate.
 
 `--minimize` gains nothing over a multi-core CPU. Minimizing a docked pose
 costs about 2 ms of CPU time; the GPU does all 1890 in 0.14 s, but the rest of

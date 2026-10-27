@@ -32,8 +32,10 @@ target_link_libraries(smina_portable PRIVATE sminagpu_portable)
 # disabling FMA contraction (x86-64 smina is built without FMA).
 set_source_files_properties(gpu_kernels_f64.cu gpu_device.cu
   PROPERTIES COMPILE_OPTIONS "--fmad=false")
+# Every host thread gets its own default stream, so that several threads can
+# drive one device concurrently (streamed screening).
 target_compile_options(sminagpu_kernels PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -Xcompiler=-Wno-deprecated-declarations>)
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr --default-stream per-thread -Xcompiler=-Wno-deprecated-declarations>)
 
 add_executable(gpu_eval_test tests/gpu_eval_test.cpp)
 target_link_libraries(gpu_eval_test PRIVATE sminagpu)

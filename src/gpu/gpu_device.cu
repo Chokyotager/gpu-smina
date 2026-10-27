@@ -19,10 +19,13 @@ void cuda_check(int err, const char* what)
 	}
 }
 
+// Stream-ordered allocation on the calling thread's default stream: unlike
+// cudaMalloc / cudaFree, it does not synchronize with work that other host
+// threads run on the same device.
 void DevBuf::release()
 {
 	if (ptr)
-		cudaFree(ptr);
+		cudaFreeAsync(ptr, cudaStreamPerThread);
 	ptr = 0;
 	bytes = 0;
 }
@@ -32,7 +35,7 @@ void DevBuf::alloc(size_t n)
 	release();
 	if (n == 0)
 		n = 1;
-	cuda_check(cudaMalloc(&ptr, n), "cudaMalloc");
+	cuda_check(cudaMallocAsync(&ptr, n, cudaStreamPerThread), "cudaMallocAsync");
 	bytes = n;
 }
 
@@ -49,7 +52,7 @@ void DevBuf::download(void* dst, size_t n) const
 
 void DevBuf::zero()
 {
-	cuda_check(cudaMemset(ptr, 0, bytes), "memset");
+	cuda_check(cudaMemsetAsync(ptr, 0, bytes, cudaStreamPerThread), "memset");
 }
 
 template<typename T>
@@ -243,7 +246,7 @@ void DeviceGrids<T>::build(const FlatReceptor& rec_for_grid,
 	build_grids_kernel<T><<<blocks, threads>>>(dgeo, drec.dev, dtab.dev,
 			int(needed.size()), out, hascharge, dug.dev, slope, tl.get<int>());
 	cuda_check(cudaGetLastError(), "build_grids_kernel launch");
-	cuda_check(cudaDeviceSynchronize(), "build_grids_kernel");
+	cuda_check(cudaStreamSynchronize(cudaStreamPerThread), "build_grids_kernel");
 }
 
 template<typename T>

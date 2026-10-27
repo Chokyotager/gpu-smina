@@ -49,14 +49,22 @@ struct ChainResult
 	std::vector<std::vector<double> > coords; // heavy atoms, 3 per atom
 };
 
-// monte_carlo::operator() for every chain (one warp each), using the cache
-// grids in ic.  progress, if given, counts completed MC steps (host-mapped).
+// load every kernel of the precision on the current device (see the
+// definition)
+template<typename T>
+void preload_kernels();
+
+// monte_carlo::operator() for every chain, using the cache grids in ic.
+// progress, if given, counts completed MC steps (host-mapped).  With
+// threads_per_chain == 0 and the device's resident thread count given, the
+// threads per chain grow as chains finish (see mc_phases); the chains'
+// results do not depend on where a phase boundary falls.
 template<typename T>
 void run_monte_carlo(const DeviceModels<T>& models,
 		const DeviceTables<T>& tables, const InterContext<T>& ic,
 		const MCParams& params, const std::vector<ChainInput>& chains,
 		std::vector<ChainResult>& results, unsigned* progress = 0,
-		int threads_per_chain = 32);
+		int threads_per_chain = 32, size_t resident_threads = 0);
 
 // quasi_newton::operator() (bfgs) on every conf in place (one warp each);
 // returns the minimized energies.  Uses ic's back end (cache or non_cache).

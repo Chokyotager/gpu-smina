@@ -13,6 +13,9 @@
  * of the run; the GPU's cell lists are always complete.
  * There, GPU_TEST_TRACE=1 logs every CPU evaluation (energy, gradient); compare
  * with the GPUEVAL lines of a build with -DGPU_TRACE_EVALS.
+ * GPU_TEST_SLICES=n: run the chains in n resumed phases (alternating 32 and
+ * 256 threads per chain); GPU_TEST_RESUME=n: float chains in n phases at
+ * --tpc must equal the uninterrupted ones exactly.
  *
  * For each step count, runs `tasks` chains seeded like parallel_mc on the CPU
  * (monte_carlo::operator()) and on the GPU, and compares the resulting
@@ -547,6 +550,27 @@ int main(int argc, char* argv[])
 		std::cout << "fp32 determinism: " << diff << " differing chain results in "
 				<< 5 * tasks << "\n";
 		return diff != 0;
+	}
+
+	if (getenv("GPU_TEST_RESUME"))
+	{
+		// float chains split into phases (same threads per chain) must equal
+		// the uninterrupted chains exactly
+		par.mc.num_steps = steps[0];
+		std::vector<output_container> whole, split;
+		run_gpu(m, fm, ft, g32, par, seeds, c1, c2, whole, tpc);
+		char tpcs[16];
+		snprintf(tpcs, sizeof(tpcs), "%d", tpc);
+		setenv("GPU_TEST_SLICES", getenv("GPU_TEST_RESUME"), 1);
+		setenv("GPU_TEST_SLICES_TPC", tpcs, 1);
+		run_gpu(m, fm, ft, g32, par, seeds, c1, c2, split, tpc);
+		unsetenv("GPU_TEST_SLICES");
+		unsetenv("GPU_TEST_SLICES_TPC");
+		Compare c = compare(whole, split, fm, 0);
+		std::cout << "fp32 resume (" << getenv("GPU_TEST_RESUME")
+				<< " phases): " << c.identical << "/" << c.chains
+				<< " chains identical\n";
+		return c.identical == c.chains ? 0 : 1;
 	}
 
 	if (getenv("GPU_TEST_REFINE_DET"))
