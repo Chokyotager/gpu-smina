@@ -19,8 +19,14 @@ target_include_directories(sminalib_portable PUBLIC
 target_link_libraries(sminalib_portable PUBLIC ${SMINA_LIB_DEPS})
 target_compile_definitions(sminalib_portable PUBLIC SMINA_PORTABLE_MATH
   BOOST_TIMER_ENABLE_DEPRECATED BOOST_ALLOW_DEPRECATED_HEADERS)
-add_library(sminagpu_portable STATIC gpu_flatten.cpp gpu_search.cpp)
+add_library(sminagpu_portable STATIC gpu_flatten.cpp gpu_search.cpp
+  gpu_docking.cpp)
 target_link_libraries(sminagpu_portable PUBLIC sminalib_portable sminagpu_kernels)
+# smina against the portable library: `smina_portable` (CPU) and
+# `smina_portable --gpu --gpu_fp64` must write identical results
+add_executable(smina_portable ${CMAKE_SOURCE_DIR}/src/main/main.cpp)
+target_compile_definitions(smina_portable PRIVATE SMINA_GPU)
+target_link_libraries(smina_portable PRIVATE sminagpu_portable)
 
 # Double precision is the validation path: keep CPU-identical rounding by
 # disabling FMA contraction (x86-64 smina is built without FMA).

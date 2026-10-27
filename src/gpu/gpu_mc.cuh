@@ -165,8 +165,15 @@ template<typename T, bool ORDERED, int TPC> __device__ __forceinline__ T evaluat
 	T e = eval_deriv<T, ORDERED>(f.mv, f.tb, f.ic, f.v, f.slope, f.box, x, g,
 			f.ws, G);
 #ifdef GPU_TRACE_EVALS
+	G.sync();
 	if (G.rank == 0 && blockIdx.x == 0 && threadIdx.x == 0)
-		printf("GPUEVAL %.17g\n", double(e));
+	{
+		printf("GPUEVAL %.17g", double(e));
+		for (int i = 0; i < f.mv.d.change_size; i++)
+			printf(" %.17g", double(g[i]));
+		printf("\n");
+	}
+	G.sync();
 #endif
 	return e;
 }

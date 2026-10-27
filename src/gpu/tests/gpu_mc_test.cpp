@@ -4,6 +4,16 @@
  *   gpu_mc_test receptor ligand [--steps a,b,...] [--tasks n] [--seed s]
  *       [--scoring name] [--approximation linear|spline] [--flexres spec]
  *
+ * GPU_TEST_REFINE=n (0: all) [GPU_TEST_FIRST=k]: --minimize of the poses in
+ * `ligand` (use --approximation spline --factor 10 like --minimize).  With
+ * GPU_TEST_FULL_CELLS=1 every cell of the CPU's szv_grid_cache is filled
+ * completely first: smina fills a cell from the first coordinate that probes
+ * it, and an atom exactly on a 3 A plane (e.g. z = -6.0000 in the input)
+ * leaves it with a degenerate brick and an incomplete atom list for the rest
+ * of the run; the GPU's cell lists are always complete.
+ * There, GPU_TEST_TRACE=1 logs every CPU evaluation (energy, gradient); compare
+ * with the GPUEVAL lines of a build with -DGPU_TRACE_EVALS.
+ *
  * For each step count, runs `tasks` chains seeded like parallel_mc on the CPU
  * (monte_carlo::operator()) and on the GPU, and compares the resulting
  * output containers.  The double precision GPU build must reproduce the CPU
@@ -20,6 +30,8 @@
 #include "quasi_newton.h"
 #include "bfgs.h"
 #include "gpu_search.h"
+#include "non_cache.h"
+#include <cfloat>
 
 using namespace gpusmina;
 
@@ -96,6 +108,187 @@ double run_gpu(model& m, const FlatModel& fm, const FlatTables& ft,
 	return secs;
 }
 
+// access to non_cache's box and cell lists
+struct probe_non_cache: public non_cache
+{
+	probe_non_cache(szv_grid_cache& gc, const grid_dims& gd, const precalculate* p,
+			fl slope) :
+			non_cache(gc, gd, p, slope)
+	{
+	}
+	const grid_dims& get_gd() const
+	{
+		return gd;
+	}
+	const szv& possibilities(const vec& c) const
+	{
+		return sgrid.possibilities(c);
+	}
+};
+
+// quasi_newton_aux, logging every evaluation (GPU_TEST_TRACE)
+struct tracing_aux
+{
+	model* m;
+	const precalculate* p;
+	const igrid* ig;
+	vec v;
+	const grid* ug;
+	const FlatModel* fm;
+	fl operator()(const conf& c, change& g)
+	{
+		const fl e = m->eval_deriv(*p, *ig, v, c, g, *ug);
+		std::vector<double> fg(fm->change_size);
+		change_to_flat(g, *fm, &fg[0]);
+		std::cout << "CPUEVAL " << std::setprecision(17) << e;
+		for (size_t i = 0; i < fg.size(); i++)
+			std::cout << " " << fg[i];
+		std::cout << "\n";
+		return e;
+	}
+};
+
+// main.cpp refine_structure
+void cpu_refine_structure(model& m, const precalculate& prec, non_cache& nc,
+		output_type& out, const vec& cap, const minimization_params& minparm,
+		grid& user_grid, const FlatModel* fm = 0)
+{
+	change g(m.get_size());
+	quasi_newton quasi_newton_par(minparm);
+	const fl slope_orig = nc.getSlope();
+	fl slope = 10;
+	VINA_FOR(p, 5)
+	{
+		nc.setSlope(slope);
+		if (getenv("GPU_TEST_TRACE"))
+		{
+			tracing_aux aux = {&m, &prec, &nc, cap, &user_grid, fm};
+			out.e = bfgs(aux, out.c, g, 0.0, minparm);
+		}
+		else
+			quasi_newton_par(m, prec, nc, out, g, cap, user_grid);
+		m.set(out.c);
+		if (nc.within(m))
+			break;
+		slope *= 10;
+	}
+	out.coords = m.get_heavy_atom_movable_coords();
+	if (!nc.within(m))
+		out.e = max_fl;
+	nc.setSlope(slope_orig);
+}
+
+// --minimize on every pose of a file: CPU (main.cpp's local_only path) vs
+// the GPU's batched refine in double precision.  Run with the portable-math
+// build the two must agree exactly.
+int refine_test(const model& initm, const std::string& ligname,
+		const precalculate& prec, int tpc)
+{
+	MolGetter mols(initm, true);
+	mols.setInputFile(ligname);
+	std::vector<model*> ms;
+	model m;
+	while (mols.readMoleculeIntoModel(m))
+		ms.push_back(new model(m));
+	const int first = getenv("GPU_TEST_FIRST") ? atoi(getenv("GPU_TEST_FIRST")) : 0;
+	const int count = atoi(getenv("GPU_TEST_REFINE"));
+	const int last = std::min<int>(ms.size(), count > 0 ? first + count : ms.size());
+	minimization_params minparm; // --minimize defaults
+	minparm.maxiters = 10000;
+	minparm.type = minimization_params::BFGSAccurateLineSearch;
+	const vec cap(10, 10, 10);
+	grid user_grid;
+
+	std::vector<FlatModel> fms(last - first);
+	std::vector<const FlatModel*> fmp;
+	std::vector<std::vector<double> > confs;
+	std::vector<FlatGridGeometry> boxes;
+	std::vector<double> cpu_e;
+	std::vector<std::vector<double> > cpu_conf;
+	double cpu_s = 0;
+	for (int i = first; i < last; i++)
+	{
+		model& mi = *ms[i];
+		FlatModel& fm = fms[i - first];
+		fm = gpu_model_flattener::flatten_model(mi);
+		fmp.push_back(&fm);
+		const grid_dims gd = mi.movable_atoms_box(4, 0.375);
+		boxes.push_back(gpu_model_flattener::grid_geometry(gd));
+		confs.push_back(std::vector<double>(fm.conf_size));
+		conf_to_flat(mi.get_initial_conf(), fm, &confs.back()[0]);
+
+		boost::timer::cpu_timer timer;
+		szv_grid_cache gridcache(mi, prec.cutoff_sqr());
+		probe_non_cache nc(gridcache, gd, &prec, 1e6);
+		if (getenv("GPU_TEST_FULL_CELLS"))
+		{
+			// probe every 3 A cell of the box at its centre first, so that
+			// szv_grid_cache fills it with the whole cell's neighbours
+			int lo[3], hi[3];
+			for (int k = 0; k < 3; k++)
+			{
+				lo[k] = int(std::floor(gd[k].begin / 3.0));
+				hi[k] = int(std::floor(gd[k].end / 3.0));
+			}
+			for (int x = lo[0]; x <= hi[0]; x++)
+				for (int y = lo[1]; y <= hi[1]; y++)
+					for (int z = lo[2]; z <= hi[2]; z++)
+						nc.possibilities(vec(3 * x + 1.5, 3 * y + 1.5, 3 * z + 1.5));
+		}
+		output_type out(mi.get_initial_conf(), max_fl);
+		cpu_refine_structure(mi, prec, nc, out, cap, minparm, user_grid, &fm);
+		cpu_s += timer.elapsed().wall / 1e9;
+		cpu_e.push_back(out.e);
+		cpu_conf.push_back(std::vector<double>(fm.conf_size));
+		conf_to_flat(out.c, fm, &cpu_conf.back()[0]);
+	}
+	const int n = last - first;
+	DeviceModels<double> dmodels;
+	dmodels.upload(fmp);
+	DeviceTables<double> dtables;
+	dtables.upload(gpu_model_flattener::flatten_tables(prec));
+	DeviceReceptor<double> drec;
+	drec.upload(gpu_model_flattener::flatten_receptor(*ms[0], prec.cutoff_sqr()));
+	InterContext<double> ic;
+	std::memset(&ic, 0, sizeof(ic));
+	ic.use_cache = 0;
+	ic.rec = drec.dev;
+	ic.ug.initialized = 0;
+	ic.slope = 1e6;
+	MinParams prm = {minparm.maxiters, 1, 0};
+	std::vector<int> model_of(n);
+	for (int i = 0; i < n; i++)
+		model_of[i] = i;
+	std::vector<double> e;
+	std::vector<std::vector<double> > coords;
+	const double v[3] = {cap[0], cap[1], cap[2]};
+	boost::timer::cpu_timer timer;
+	run_refine(dmodels, dtables, ic, prm, v, model_of, confs, e, coords, tpc,
+			std::vector<unsigned>(n, minparm.maxiters), boxes);
+	const double gpu_s = timer.elapsed().wall / 1e9;
+	int same = 0, close = 0;
+	for (int i = 0; i < n; i++)
+	{
+		double dc = 0;
+		for (size_t k = 0; k < confs[i].size(); k++)
+			dc = std::max(dc, std::abs(confs[i][k] - cpu_conf[i][k]));
+		const double ge = e[i] >= DBL_MAX ? max_fl : e[i];
+		const double de = std::abs(ge - cpu_e[i]);
+		const bool s = de <= 1e-9 * std::max(1.0, std::abs(cpu_e[i])) && dc < 1e-6;
+		same += s;
+		close += de < 0.01;
+		if (!s)
+			std::cout << "pose " << first + i << ": cpu e " << std::setprecision(10)
+					<< cpu_e[i] << " gpu e " << ge << " dconf " << dc << "\n";
+	}
+	std::cout << "refine fp64: " << same << "/" << n << " identical, " << close
+			<< "/" << n << " within 0.01; cpu " << cpu_s << " s, gpu " << gpu_s
+			<< " s\n";
+	for (size_t i = 0; i < ms.size(); i++)
+		delete ms[i];
+	return same == n ? 0 : 1;
+}
+
 std::vector<int> parse_list(const std::string& s)
 {
 	std::vector<int> v;
@@ -163,6 +356,8 @@ int main(int argc, char* argv[])
 	gputest::setup_terms(t, scoring, "");
 	weighted_terms wt(&t, t.weights());
 	boost::shared_ptr<precalculate> prec = gputest::make_prec(wt, approx, factor);
+	if (getenv("GPU_TEST_REFINE"))
+		return refine_test(initm, ligname, *prec, tpc);
 	grid_dims gd = gputest::ligand_box(m, 4);
 	if (autobox.size())
 	{

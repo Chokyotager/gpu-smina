@@ -21,6 +21,8 @@
 #include <cuda_runtime.h>
 #include <type_traits>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 namespace gpusmina
 {
@@ -566,6 +568,37 @@ void run_monte_carlo(const DeviceModels<T>& models,
 
 ////////////////////////////// bfgs //////////////////////////////
 
+static __global__ void stamp_kernel(unsigned long long* t)
+{
+	unsigned long long v;
+	asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(v));
+	*t = v;
+}
+
+template<typename T>
+static void report_item_times(DevBuf& dend, int n, unsigned long long t0,
+		const std::vector<int>& model_of, const DeviceModels<T>& models)
+{
+	std::vector<unsigned long long> end(n);
+	dend.download(&end[0], sizeof(unsigned long long) * n);
+	std::vector<std::pair<double, int> > t(n);
+	for (int c = 0; c < n; c++)
+		t[c] = std::make_pair((end[c] - t0) * 1e-6, c);
+	std::sort(t.begin(), t.end());
+	const double q[] = {0.5, 0.9, 0.99, 0.999};
+	fprintf(stderr, "item end times (ms after launch), %d items:", n);
+	for (int i = 0; i < 4; i++)
+		fprintf(stderr, " p%g %.1f", q[i] * 100, t[size_t(q[i] * (n - 1))].first);
+	fprintf(stderr, " max %.1f\nslowest:", t[n - 1].first);
+	for (int i = n - 1; i >= 0 && i >= n - 10; i--)
+	{
+		const ModelDesc& d = models.host_desc[model_of[t[i].second]];
+		fprintf(stderr, " #%d(%.0fms,%d atoms,%d pairs)", t[i].second,
+				t[i].first, d.num_movable, d.num_pairs);
+	}
+	fprintf(stderr, "\n");
+}
+
 template<typename T, int TPC>
 __global__ void __launch_bounds__(BLOCK_THREADS, MinBlocks<TPC>::value) bfgs_kernel(
 		const __grid_constant__ DevModels<T> dm, const BlockTask* tasks,
@@ -577,7 +610,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, MinBlocks<TPC>::value) bfgs_ker
 		const __grid_constant__ GlobalScratch<T> gs,
 		const __grid_constant__ ScratchOffsets so, int* error, T* out_e,
 		int refine, T* out_coords, int max_heavy, const unsigned* item_maxiters,
-		const DevBox<T>* item_box)
+		const DevBox<T>* item_box, unsigned long long* item_end)
 {
 	Group<TPC> G;
 	int c;
@@ -609,7 +642,15 @@ __global__ void __launch_bounds__(BLOCK_THREADS, MinBlocks<TPC>::value) bfgs_ker
 	if (plan.hot_shared)
 		copy_n(gd->mem + co.tmp, gd->cv.tmp, mv.d.conf_size, G);
 	if (G.rank == 0)
+	{
 		out_e[c] = e;
+		if (item_end)
+		{
+			unsigned long long t;
+			asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+			item_end[c] = t;
+		}
+	}
 }
 
 template<typename T, int TPC>
@@ -618,7 +659,8 @@ static void launch_bfgs(const DeviceModels<T>& models,
 		const InterContext<T>& ic, const MinParams& params, const double v[3],
 		const ScratchOffsets& so, const ChainOffsets& co, DevBuf& dmem,
 		DevBuf& dimem, DevBuf& derr, DevBuf& de, int refine, DevBuf& dcoords,
-		const unsigned* dmaxiters, const DevBox<T>* dboxes)
+		const unsigned* dmaxiters, const DevBox<T>* dboxes,
+		unsigned long long* ditem_end)
 {
 	std::vector<BlockTask> tasks = make_tasks(model_of, BLOCK_THREADS / TPC);
 	SharedPlan plan = plan_shared<T, TPC>((const void*) bfgs_kernel<T, TPC>,
@@ -631,7 +673,7 @@ static void launch_bfgs(const DeviceModels<T>& models,
 			models.dev, dtasks.get<BlockTask>(), plan, tables.dev, ic, params,
 			T(v[0]), T(v[1]), T(v[2]), dmem.get<T>(), dimem.get<int>(), co, gs, so,
 			derr.get<int>(), de.get<T>(), refine, dcoords.get<T>(),
-			models.max_heavy, dmaxiters, dboxes);
+			models.max_heavy, dmaxiters, dboxes, ditem_end);
 	cuda_check(cudaGetLastError(), "bfgs_kernel launch");
 	cuda_check(cudaDeviceSynchronize(), "bfgs_kernel");
 }
@@ -680,18 +722,34 @@ static bool run_minimizer(const DeviceModels<T>& models,
 		dcoords.alloc(sizeof(T) * size_t(n) * 3 * models.max_heavy);
 	int zero = 0;
 	derr.upload(&zero, sizeof(int));
+	// GPU_ITEM_TIMES=1: report when each item finished (tail diagnostics)
+	const bool item_times = getenv("GPU_ITEM_TIMES") != 0;
+	DevBuf dend;
+	if (item_times)
+		dend.alloc(sizeof(unsigned long long) * n);
+	unsigned long long* pend = item_times ? dend.get<unsigned long long>()
+			: (unsigned long long*) 0;
+	unsigned long long t_launch = 0;
+	if (item_times)
+	{
+		// globaltimer of the launch: a trivial kernel's stamp
+		unsigned long long* p0 = pend;
+		stamp_kernel<<<1, 1>>>(p0);
+		cuda_check(cudaMemcpy(&t_launch, p0, sizeof(t_launch),
+				cudaMemcpyDeviceToHost), "stamp");
+	}
 	if (threads_per_chain >= 256)
 		launch_bfgs<T, 256>(models, model_of, tables, ic, params, v, so, co, dmem,
-				dimem, derr, de, refine, dcoords, pmax, pbox);
+				dimem, derr, de, refine, dcoords, pmax, pbox, pend);
 	else if (threads_per_chain >= 128)
 		launch_bfgs<T, 128>(models, model_of, tables, ic, params, v, so, co, dmem,
-				dimem, derr, de, refine, dcoords, pmax, pbox);
+				dimem, derr, de, refine, dcoords, pmax, pbox, pend);
 	else if (threads_per_chain >= 64)
 		launch_bfgs<T, 64>(models, model_of, tables, ic, params, v, so, co, dmem,
-				dimem, derr, de, refine, dcoords, pmax, pbox);
+				dimem, derr, de, refine, dcoords, pmax, pbox, pend);
 	else
 		launch_bfgs<T, 32>(models, model_of, tables, ic, params, v, so, co, dmem,
-				dimem, derr, de, refine, dcoords, pmax, pbox);
+				dimem, derr, de, refine, dcoords, pmax, pbox, pend);
 	dmem.download(&mem[0], sizeof(T) * mem.size());
 	std::vector<T> he(n);
 	de.download(&he[0], sizeof(T) * n);
@@ -714,6 +772,8 @@ static bool run_minimizer(const DeviceModels<T>& models,
 			(*coords)[c].assign(src, src + 3 * d.num_heavy);
 		}
 	}
+	if (item_times)
+		report_item_times(dend, n, t_launch, model_of, models);
 	int err = 0;
 	derr.download(&err, sizeof(int));
 	return err == 0;
