@@ -90,8 +90,9 @@ public:
 // device holds at 32 threads per chain.  A few ligands leave most of the GPU
 // idle and get 32; a screen already fills the GPU and only gains at its
 // tail, while shorter chains need more evaluations for the same number of
-// steps.  At least 4: --fast also halves the steps, which longer chains do
-// not tolerate (screen top scores drift).  Measured: README.GPU.md.
+// steps.  At least 4: below 32, --fast also halves the steps, which longer
+// chains do not tolerate (screen top scores drift).  Measured:
+// README.GPU.md.
 static int auto_split(size_t tasks, size_t capacity)
 {
 	int split = 32;
@@ -100,13 +101,21 @@ static int auto_split(size_t tasks, size_t capacity)
 	return split;
 }
 
+// --fast (GpuSettings::step_fraction 0): half the steps once the GPU is
+// full (split below 32), where that halves the time; with fewer chains a
+// run is mostly fixed overhead, and the full search keeps its scores
+static double auto_fraction(int split)
+{
+	return split >= 32 ? 1.0 : 0.5;
+}
+
 struct EngineBase
 {
 	int device;
 	int sm_count;
 	Residency mc_res, bfgs_res; // of this engine's kernels
 	int chain_split; // GpuSettings::chain_split (0: automatic)
-	double step_fraction; // GpuSettings::step_fraction
+	double step_fraction; // GpuSettings::step_fraction (0: automatic)
 	bool skip_visited; // GpuSettings::skip_visited
 	explicit EngineBase(int d) :
 			device(d), sm_count(1), chain_split(1), step_fraction(1),
@@ -148,6 +157,11 @@ struct EngineBase
 			const precalculate& p, const vec& corner1, const vec& corner2,
 			int seed, double cache_slope, const vec& cap, unsigned* progress,
 			int tpc) = 0;
+	double fraction_for(int split) const
+	{
+		return step_fraction > 0 ? step_fraction : auto_fraction(split);
+	}
+
 	// chains per search task when this device docks `tasks` tasks at once
 	int split_for(size_t tasks) const
 	{
@@ -168,7 +182,7 @@ struct EngineBase
 		{
 			ChainInput c = make_chain(m, fm, model_index,
 					::random_int(0, 1000000, generator), corner1, corner2);
-			c.num_steps = chain_steps(mp.num_steps, split, step_fraction);
+			c.num_steps = chain_steps(mp.num_steps, split, fraction_for(split));
 			c.maxiters = mp.min.maxiters;
 			chains.push_back(c);
 		}
@@ -338,7 +352,7 @@ struct Engine: public EngineBase
 					cudaHostAllocMapped), "cudaHostAlloc");
 			*counter = 0;
 			poller = new ProgressPoller(counter, (unsigned long) chains.size()
-					* chain_steps(par.mc.num_steps, split, step_fraction));
+					* chain_steps(par.mc.num_steps, split, fraction_for(split)));
 		}
 		std::vector<ChainResult> results;
 		try
@@ -730,7 +744,7 @@ void GpuDocking::dock_batch(std::vector<DockJob*>& jobs, const precalculate& p,
 		for (size_t j = start[d]; j < start[d + 1]; j++)
 			total_steps += (unsigned long) jobs[j]->par.num_tasks * split
 					* EngineBase::chain_steps(jobs[j]->par.mc.num_steps, split,
-							settings.step_fraction);
+							engines[d]->fraction_for(split));
 	}
 	unsigned* counter = 0;
 	ProgressPoller* poller = 0;

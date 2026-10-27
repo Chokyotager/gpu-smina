@@ -1064,7 +1064,7 @@ Thank you!\n";
 						"GPU device(s) to use, comma separated (e.g. 0,1)")
 				("gpu", bool_switch(&gpu_on), "Turn on GPU acceleration")
 				("fast", bool_switch(&gpu_fast),
-						"With --gpu: a faster GPU-style search that is not smina's: QuickVina 2's history check skips redundant local optimizations, the Monte Carlo chains are split into 4-32 shorter concurrent ones and run half of smina's steps (validated against smina; see README.GPU.md)")
+						"With --gpu: a faster GPU-style search that is not smina's: QuickVina 2's history check skips redundant local optimizations, the Monte Carlo chains are split into 4-32 shorter concurrent ones, and screens run half of smina's steps (validated against smina; see README.GPU.md)")
 				("gpu_split", value<int>(&gpu_split)->default_value(1),
 						"GPU-style search (not smina's): replace every Monte Carlo chain by this many concurrent chains with 1/N of the steps each; faster, especially for single ligands (see README.GPU.md)")
 #endif
@@ -1386,7 +1386,7 @@ Thank you!\n";
 				if (vm["gpu_split"].defaulted())
 					gs.chain_split = 0; // automatic
 				if (vm["gpu_budget"].defaulted())
-					gs.step_fraction = 0.5;
+					gs.step_fraction = 0; // automatic
 			}
 			gpu.reset(new gpusmina::GpuDocking(gs));
 			gpu_engine = gpu.get();
