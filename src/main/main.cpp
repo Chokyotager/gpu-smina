@@ -1066,7 +1066,7 @@ Thank you!\n";
 				("fast", bool_switch(&gpu_fast),
 						"With --gpu: a faster GPU-style search that is not smina's: QuickVina 2's history check skips redundant local optimizations, the Monte Carlo chains are split into 4-32 shorter concurrent ones, and screens run half of smina's steps (validated against smina; see README.GPU.md)")
 				("gpu_split", value<int>(&gpu_split)->default_value(1),
-						"GPU-style search (not smina's): replace every Monte Carlo chain by this many concurrent chains with 1/N of the steps each; faster, especially for single ligands (see README.GPU.md)")
+						"GPU-style search (not smina's): replace every Monte Carlo chain by this many concurrent chains with 1/N of the steps each; faster, especially for single ligands; --fast chooses N automatically (see README.GPU.md)")
 #endif
 				;
 

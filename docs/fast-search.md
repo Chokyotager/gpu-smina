@@ -29,7 +29,7 @@ p-values from permutation tests within complexes):
 | | success | mean top score (kcal/mol) |
 |---|---|---|
 | CPU smina | 92/125 | −9.835 |
-| `--gpu` (1:1) | 91/125 (p = 1.00) | −9.816 (p = 0.43) |
+| `--gpu` (1:1) | 90/125 (p = 0.60) | −9.818 (p = 0.51) |
 | `--gpu --fast`, single complex | 93/125 (p = 1.00) | −9.838 (p = 0.79) |
 | `--fast` screening form, split 8 | 90/125 (p = 0.62) | −9.825 (p = 0.39) |
 
@@ -110,8 +110,8 @@ screens part of the gain.
 
 ## Reproducing
 
-- **Hidden switches:** `--gpu_qvina`, `--gpu_split N` and `--gpu_budget F`
-  set the components individually.
+- **Components:** `--gpu_split N` and the hidden `--gpu_qvina` and
+  `--gpu_budget F` set them individually.
 - **Tracing:** `GPU_TRACE_STEPS=file` records per-chain convergence.
 - **Benchmarks:** `tools/redock_benchmark.py --gpu-only --gpu-args "..."
   --label name` runs the redocking set; `tools/compare_redock.py` and

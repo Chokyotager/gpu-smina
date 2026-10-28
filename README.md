@@ -44,7 +44,7 @@ Ryzen 9 5950X (16 cores) vs RTX 4080 SUPER (+ RTX 4070 Ti SUPER):
 ## Validation
 
 - Redocking 25 Astex complexes × 5 seeds (top pose < 2 Å): CPU 73.6%,
-  `--gpu` 72.8%, `--gpu --fast` 74.4%; differences within run-to-run noise.
+  `--gpu` 72.0%, `--gpu --fast` 74.4%; differences within run-to-run noise.
 - Screening top scores differ from CPU smina by s.d. 0.074 kcal/mol with
   `--gpu` and 0.081-0.083 with `--fast`; two CPU runs with different seeds
   differ by 0.073.

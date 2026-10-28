@@ -10,7 +10,7 @@ the program behaves exactly as before.
 `--fast` additionally offers a GPU-style search that is *not* smina's: it
 skips local optimizations that QuickVina 2's history check deems redundant,
 splits every Monte Carlo chain into several shorter concurrent ones and, on
-screens, runs half of smina's steps. It docks a single complex 10-20 times
+screens, runs half of smina's steps. It docks a single complex 8-20 times
 faster than the 1:1 port and screens 2-4 times faster, with the same
 redocking success and screening scores as CPU smina (see below and
 [docs/fast-search.md](docs/fast-search.md)).
@@ -100,12 +100,11 @@ not depend on it.
   70.4%. Against the portable CPU build, the GPU's double precision
   minimizations are bit-identical for all 1890 once the CPU cell-list quirk
   described below is excluded (`GPU_TEST_FULL_CELLS`), 1888/1890 with it.
-
 * **`--fast`**, the same 25 Astex complexes × 5 seeds: 93/125 (74.4%), mean
   top score −9.838 kcal/mol; against the CPU (92/125, −9.835), +1 success
   (permutation p = 1.00) and −0.003 kcal/mol (p = 0.79). Its screening forms,
-  with half the steps, redock within noise as well: split 8, 90/125 (p = 0.62;
-  +0.010 kcal/mol, p = 0.39); split 16, 92/125 (+0.024, p = 0.13). On the
+  splits 8 and 16 with half the steps, redock within noise as well: 90 and
+  92/125, top scores +0.010 and +0.024 kcal/mol (p ≥ 0.13). On the
   210-ligand screen (split 4 on one GPU, 8 on two), top scores differ from the
   CPU's by s.d. 0.083 (one GPU) and 0.081 kcal/mol (two GPUs), means within
   0.002; two CPU runs with different seeds differ by 0.073. Validated with
@@ -176,8 +175,8 @@ chains within 4 waves (32 for a single complex, 4 or 8 for the screens
 above), because shorter chains need more evaluations for the same steps.
 Once the GPU is full (split below 32), half of smina's steps are run, which
 halves a screen's time; a single complex's run is mostly fixed overhead, so
-it keeps the full budget. Budgets below half, and the budgets of Uni-Dock
-(about 1-8% of smina's steps), cost redocking success and top scores.
+it keeps the full budget. Budgets of ⅛ and below, like Uni-Dock's (about
+1-8% of smina's steps), cost redocking success and top scores.
 [docs/fast-search.md](docs/fast-search.md) has the measurements.
 
 `--minimize` gains nothing over a multi-core CPU. Minimizing a docked pose
