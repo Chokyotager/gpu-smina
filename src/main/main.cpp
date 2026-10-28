@@ -1445,12 +1445,15 @@ Thank you!\n";
 				throw usage_error("--gpu_budget must be positive");
 			gs.step_fraction = gpu_budget;
 			gs.skip_visited = gpu_qvina;
-			gs.early_stop = gpu_early_stop;
+			gs.early_stop = gpu_early_stop
+					? gpusmina::GpuSettings::EARLY_STOP_ALWAYS
+					: gpusmina::GpuSettings::EARLY_STOP_OFF;
 			if (gpu_fast)
 			{
 				// explicit --gpu_split / --gpu_budget take precedence
 				gs.skip_visited = true;
-				gs.early_stop = true;
+				if (!gpu_early_stop)
+					gs.early_stop = gpusmina::GpuSettings::EARLY_STOP_FULL;
 				if (vm["gpu_split"].defaulted())
 					gs.chain_split = 0; // automatic
 				if (vm["gpu_budget"].defaulted())

@@ -119,12 +119,12 @@ struct EngineBase
 	int chain_split; // GpuSettings::chain_split (0: automatic)
 	double step_fraction; // GpuSettings::step_fraction (0: automatic)
 	bool skip_visited; // GpuSettings::skip_visited
-	bool early_stop; // GpuSettings::early_stop
+	int early_stop; // GpuSettings::early_stop
 	EarlyStop stop_rule;
 	bool stop_env; // stop_rule set by GPU_EARLY_STOP
 	explicit EngineBase(int d) :
 			device(d), sm_count(1), chain_split(1), step_fraction(1),
-					skip_visited(false), early_stop(false), stop_env(false)
+					skip_visited(false), early_stop(0), stop_env(false)
 	{
 		cudaDeviceProp prop;
 		cuda_check(cudaSetDevice(device), "cudaSetDevice");
@@ -168,6 +168,13 @@ struct EngineBase
 	{
 		return budget > 0 ? budget : step_fraction > 0 ? step_fraction
 				: auto_fraction(split);
+	}
+	// whether chains of `split` (and a first-pass budget) stop early
+	bool stops(int split, double budget = 0) const
+	{
+		return !(budget > 0)
+				&& (early_stop == GpuSettings::EARLY_STOP_ALWAYS
+						|| (early_stop == GpuSettings::EARLY_STOP_FULL && split < 32));
 	}
 	// the early stopping rule for chains of `split`: checks after every
 	// tenth of smina's steps the chains run, from the second on
@@ -379,7 +386,7 @@ struct Engine: public EngineBase
 		try
 		{
 			run_monte_carlo(models, tables, context(true, cache_slope), prm,
-					chains, results, counter, tpc, &mc_res, early_stop ? &es : 0);
+					chains, results, counter, tpc, &mc_res, stops(split) ? &es : 0);
 		} catch (...)
 		{
 			delete poller;
@@ -564,7 +571,7 @@ void Engine<T>::dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
 	const EarlyStop es = stop_for(split);
 	run_monte_carlo(models, tables, context(true, cache_slope), prm, chains,
 			results, progress, tpc, &mc_res,
-			early_stop && !(budget > 0) ? &es : 0);
+			stops(split, budget) ? &es : 0);
 
 	// merge_output_containers per ligand
 	std::vector<output_type*> poses;
