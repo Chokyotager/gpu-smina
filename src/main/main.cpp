@@ -6,6 +6,7 @@
 #include <vector> // ligand paths
 #include <cmath> // for ceila
 #include <algorithm>
+#include <functional>
 #include <iterator>
 #include <boost/filesystem/fstream.hpp>
 #include <boost/filesystem/exception.hpp>
@@ -321,6 +322,55 @@ void finish_docking(model& m, const boost::optional<model>& ref,
 		log.endl();
 	}
 }
+
+#ifdef SMINA_GPU
+// f(0), ..., f(n - 1) on up to `threads` threads; f must not throw
+static void for_each_index(sz n, int threads, const std::function<void(sz)>& f)
+{
+	boost::mutex next_lock;
+	sz next = 0;
+	auto work = [&]()
+	{
+		for (;;)
+		{
+			sz k;
+			{
+				boost::mutex::scoped_lock l(next_lock);
+				if (next == n)
+					return;
+				k = next++;
+			}
+			f(k);
+		}
+	};
+	const int nthreads = std::max(1, std::min<int>(threads, int(n)));
+	boost::thread_group workers;
+	for (int t = 1; t < nthreads; t++)
+		workers.create_thread(work);
+	work();
+	workers.join_all();
+}
+
+// two-pass screening: the top score finish_docking would report for these
+// poses, computed on copies (the model is left as parsed)
+static fl top_score(model m, output_container out, const weighted_terms& sf,
+		const precalculate& prec, const grid_dims& gd, fl slope,
+		const vec& authentic_v, grid& user_grid)
+{
+	if (out.empty())
+		return max_fl;
+	out.sort();
+	const fl intra = m.eval_intramolecular(prec, authentic_v, out[0].c);
+	szv_grid_cache gridcache(m, prec.cutoff_sqr());
+	non_cache nc(gridcache, gd, &prec, slope);
+	fl best = max_fl;
+	VINA_FOR_IN(i, out)
+		if (not_max(out[i].e))
+			best = std::min(best, m.eval_adjusted(sf, prec, nc, authentic_v,
+					out[i].c, intra, user_grid));
+	return best;
+}
+#endif
 
 //dkoes - return all energies and rmsds to original conf with result
 void do_search(model& m, const boost::optional<model>& ref,
@@ -918,6 +968,9 @@ Thank you!\n";
 		bool gpu_qvina = false;
 		bool gpu_early_stop = false;
 		bool gpu_fast = false;
+		double fast_top = 0.1;
+		double fast_first = 0.0625;
+		double fast_top_margin = 0.3;
 		bool gpu_fp64 = false;
 		int gpu_ligands_per_batch = 0;
 
@@ -1038,6 +1091,10 @@ Thank you!\n";
 				"Ligands docked together on the GPU (0 chooses automatically)")
 		("gpu_qvina", bool_switch(&gpu_qvina),
 				"Skip local optimizations that QuickVina 2's history check deems redundant (not smina's search; for experiments)")
+		("fast_first", value<double>(&fast_first)->default_value(0.0625, "0.0625"),
+				"--fast_top's first pass: fraction of smina's Monte Carlo steps")
+		("fast_top_margin", value<double>(&fast_top_margin)->default_value(0.3, "0.3"),
+				"--fast_top: also the full search for ligands within this many kcal/mol of the best fraction")
 		("gpu_early_stop", bool_switch(&gpu_early_stop),
 				"Stop a ligand's search once half of its exhaustiveness units agree on its best energy (not smina's search; for experiments)")
 		("gpu_budget", value<double>(&gpu_budget)->default_value(1),
@@ -1067,7 +1124,9 @@ Thank you!\n";
 						"GPU device(s) to use, comma separated (e.g. 0,1)")
 				("gpu", bool_switch(&gpu_on), "Turn on GPU acceleration")
 				("fast", bool_switch(&gpu_fast),
-						"With --gpu: a faster GPU-style search that is not smina's: QuickVina 2's history check skips redundant local optimizations, the Monte Carlo chains are split into 4-32 shorter concurrent ones, and screens run half of smina's steps (validated against smina; see README.GPU.md)")
+						"With --gpu: a faster GPU-style search that is not smina's: QuickVina 2's history check skips redundant local optimizations, the Monte Carlo chains are split into 4-32 shorter concurrent ones, a ligand's search stops once its runs agree on its best score, and screens run at most half of smina's steps and give the full search only to their best ligands (--fast_top) (validated against smina; see README.GPU.md)")
+				("fast_top", value<double>(&fast_top)->default_value(0.1, "0.1"),
+						"With --fast, screens of 20 or more ligands: dock every ligand briefly, then give the full search only to the best fraction F of them (and those within 0.3 kcal/mol of it); the others keep their first-pass results.  1: the full search for every ligand")
 				("gpu_split", value<int>(&gpu_split)->default_value(1),
 						"GPU-style search (not smina's): replace every Monte Carlo chain by this many concurrent chains with 1/N of the steps each; faster, especially for single ligands; --fast chooses N automatically (see README.GPU.md)")
 #endif
@@ -1366,6 +1425,10 @@ Thank you!\n";
 		boost::shared_ptr<gpusmina::GpuDocking> gpu;
 		if (gpu_fast && !gpu_on)
 			throw usage_error("--fast requires --gpu");
+		if (!gpu_fast)
+			fast_top = 0; // one pass
+		else if (!(fast_top > 0) || fast_top > 1 || !(fast_first > 0))
+			throw usage_error("--fast_top must be in (0, 1], --fast_first positive");
 		if (gpu_on)
 		{
 			if (approx == Exact)
@@ -1479,6 +1542,7 @@ Thank you!\n";
 			const bool compute_atominfo = atomoutfile.is_open()
 					|| settings.include_atom_info;
 			std::vector<model*> batch;
+			std::vector<double> top_history; // two-pass: first-pass top scores
 
 			auto flush = [&]()
 			{
@@ -1493,8 +1557,44 @@ Thank you!\n";
 					setup_search(*batch[k], settings, minparms, jobs[k].par);
 					jobp.push_back(&jobs[k]);
 				}
-				gpu_engine->dock_batch(jobp, *prec, gd, corner1, corner2,
-						settings.seed, user_grid, slope, authentic_v, true);
+				if (fast_top > 0 && fast_top < 1
+						&& top_history.size() + batch.size() >= 20)
+				{
+					// two-pass screening: every ligand briefly, then the full
+					// search for those that score within fast_top_margin of the
+					// best fast_top of all ligands so far
+					gpu_engine->dock_batch(jobp, *prec, gd, corner1, corner2,
+							settings.seed, user_grid, slope, authentic_v, true,
+							fast_first);
+					std::vector<double> score(batch.size());
+					for_each_index(batch.size(), settings.cpu, [&](sz k)
+					{
+						score[k] = top_score(*batch[k], jobs[k].out, wt, *prec, gd,
+								slope, authentic_v, user_grid);
+					});
+					top_history.insert(top_history.end(), score.begin(),
+							score.end());
+					std::vector<double> sorted(top_history);
+					const sz q = std::max<sz>(1, sz(std::ceil(fast_top
+							* sorted.size()))) - 1;
+					std::nth_element(sorted.begin(), sorted.begin() + q,
+							sorted.end());
+					const double cutoff = sorted[q] + fast_top_margin;
+					std::vector<gpusmina::GpuDocking::DockJob*> again;
+					VINA_FOR_IN(k, batch)
+						if (score[k] <= cutoff)
+						{
+							jobs[k].out.clear();
+							again.push_back(&jobs[k]);
+						}
+					log << "Full search for " << again.size() << " of "
+							<< batch.size() << " ligands\n";
+					gpu_engine->dock_batch(again, *prec, gd, corner1, corner2,
+							settings.seed, user_grid, slope, authentic_v, true);
+				}
+				else
+					gpu_engine->dock_batch(jobp, *prec, gd, corner1, corner2,
+							settings.seed, user_grid, slope, authentic_v, true);
 				const double gpu_time = btime.elapsed().wall / 1e9 / batch.size();
 				// finish the ligands (final scoring, clustering) on settings.cpu
 				// threads, each logging into its own buffer; then log and write
@@ -1504,49 +1604,31 @@ Thank you!\n";
 				std::vector<std::vector<result_info> > results(n);
 				std::vector<double> ftimes(n, 0);
 				std::vector<std::string> errors(n);
-				boost::mutex next_lock;
-				sz next = 0;
-				auto finish = [&]()
+				for_each_index(n, settings.cpu, [&](sz k)
 				{
-					for (;;)
+					try
 					{
-						sz k;
-						{
-							boost::mutex::scoped_lock l(next_lock);
-							if (next == n)
-								return;
-							k = next++;
-						}
-						try
-						{
-							boost::timer::cpu_timer ftime;
-							std::ostringstream text;
-							text.copyfmt(std::cout); // the log's formatting state
-							tee klog(true);
-							klog.capture = &text;
-							model& m = *batch[k];
-							boost::optional<model> ref;
-							klog << "Using random seed: " << settings.seed;
-							klog.endl();
-							szv_grid_cache gridcache(m, prec->cutoff_sqr());
-							non_cache nc(gridcache, gd, prec.get(), slope);
-							finish_docking(m, ref, wt, *prec, nc, settings,
-									compute_atominfo, klog, user_grid, results[k],
-									jobs[k].out, authentic_v);
-							texts[k] = text.str();
-							ftimes[k] = ftime.elapsed().wall / 1e9;
-						} catch (std::exception& e)
-						{
-							errors[k] = e.what();
-						}
+						boost::timer::cpu_timer ftime;
+						std::ostringstream text;
+						text.copyfmt(std::cout); // the log's formatting state
+						tee klog(true);
+						klog.capture = &text;
+						model& m = *batch[k];
+						boost::optional<model> ref;
+						klog << "Using random seed: " << settings.seed;
+						klog.endl();
+						szv_grid_cache gridcache(m, prec->cutoff_sqr());
+						non_cache nc(gridcache, gd, prec.get(), slope);
+						finish_docking(m, ref, wt, *prec, nc, settings,
+								compute_atominfo, klog, user_grid, results[k],
+								jobs[k].out, authentic_v);
+						texts[k] = text.str();
+						ftimes[k] = ftime.elapsed().wall / 1e9;
+					} catch (std::exception& e)
+					{
+						errors[k] = e.what();
 					}
-				};
-				const int nthreads = std::max(1, std::min<int>(settings.cpu, n));
-				boost::thread_group finishers;
-				for (int t = 1; t < nthreads; t++)
-					finishers.create_thread(finish);
-				finish();
-				finishers.join_all();
+				});
 				VINA_FOR(k, n)
 				{
 					if (!errors[k].empty())

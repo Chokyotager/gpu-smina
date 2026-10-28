@@ -84,10 +84,12 @@ public:
 		::parallel_mc par; // this ligand's search parameters
 		output_container out; // merged, refined poses
 	};
+	// budget > 0: run that fraction of smina's steps, without early
+	// stopping (the first pass of two-pass screening)
 	void dock_batch(std::vector<DockJob*>& jobs, const precalculate& p,
 			const grid_dims& gd, const vec& corner1, const vec& corner2,
 			int seed, const grid& user_grid, double cache_slope, const vec& cap,
-			bool display_progress);
+			bool display_progress, double budget = 0);
 
 	// Batched local optimization (--local_only / --minimize): for every job,
 	// refine_structure of job.out (in: initial conf; out: conf, e, heavy

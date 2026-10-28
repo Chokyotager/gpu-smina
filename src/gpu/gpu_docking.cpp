@@ -158,13 +158,16 @@ struct EngineBase
 			const precalculate& p, const grid_dims& gd, const grid& user_grid,
 			double cache_slope) = 0;
 	// search and refinement of `jobs` (after prepare_docking)
+	// budget > 0: that fraction of smina's steps, without early stopping
+	// (a first pass of GpuDocking::dock_batch)
 	virtual void dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
 			const precalculate& p, const vec& corner1, const vec& corner2,
 			int seed, double cache_slope, const vec& cap, unsigned* progress,
-			int tpc) = 0;
-	double fraction_for(int split) const
+			int tpc, double budget) = 0;
+	double fraction_for(int split, double budget = 0) const
 	{
-		return step_fraction > 0 ? step_fraction : auto_fraction(split);
+		return budget > 0 ? budget : step_fraction > 0 ? step_fraction
+				: auto_fraction(split);
 	}
 	// the early stopping rule for chains of `split`: checks after every
 	// tenth of smina's steps the chains run, from the second on
@@ -190,14 +193,15 @@ struct EngineBase
 	void add_chains(std::vector<ChainInput>& chains, const model& m,
 			const FlatModel& fm, int model_index, const ::parallel_mc& par,
 			rng& generator, const vec& corner1, const vec& corner2,
-			int split) const
+			int split, double budget = 0) const
 	{
 		const MCParams mp = mc_params(par.mc);
 		VINA_FOR(i, par.num_tasks * split)
 		{
 			ChainInput c = make_chain(m, fm, model_index,
 					::random_int(0, 1000000, generator), corner1, corner2);
-			c.num_steps = chain_steps(mp.num_steps, split, fraction_for(split));
+			c.num_steps = chain_steps(mp.num_steps, split,
+					fraction_for(split, budget));
 			c.maxiters = mp.min.maxiters;
 			c.unit = int(i / split);
 			chains.push_back(c);
@@ -422,7 +426,7 @@ struct Engine: public EngineBase
 	void dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
 			const precalculate& p, const vec& corner1, const vec& corner2,
 			int seed, double cache_slope, const vec& cap, unsigned* progress,
-			int tpc);
+			int tpc, double budget);
 
 	void minimize_batch(GpuDocking::MinimizeJob* jobs, size_t njobs,
 			const precalculate& p, const vec& cap, const grid& ug, int tpc)
@@ -521,7 +525,8 @@ struct Engine: public EngineBase
 template<typename T>
 void Engine<T>::dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
 		const precalculate& p, const vec& corner1, const vec& corner2, int seed,
-		double cache_slope, const vec& cap, unsigned* progress, int tpc)
+		double cache_slope, const vec& cap, unsigned* progress, int tpc,
+		double budget)
 {
 	if (njobs == 0)
 		return;
@@ -550,7 +555,7 @@ void Engine<T>::dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
 		rng generator(static_cast<rng::result_type>(seed));
 		first_chain[j] = chains.size();
 		add_chains(chains, *jobs[j]->m, fms[j], int(j), jobs[j]->par, generator,
-				corner1, corner2, split);
+				corner1, corner2, split, budget);
 	}
 	first_chain[njobs] = chains.size();
 	MCParams prm = mc_params(jobs[0]->par.mc);
@@ -558,7 +563,8 @@ void Engine<T>::dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
 	std::vector<ChainResult> results;
 	const EarlyStop es = stop_for(split);
 	run_monte_carlo(models, tables, context(true, cache_slope), prm, chains,
-			results, progress, tpc, &mc_res, early_stop ? &es : 0);
+			results, progress, tpc, &mc_res,
+			early_stop && !(budget > 0) ? &es : 0);
 
 	// merge_output_containers per ligand
 	std::vector<output_type*> poses;
@@ -743,7 +749,7 @@ size_t GpuDocking::chains_per_batch() const
 void GpuDocking::dock_batch(std::vector<DockJob*>& jobs, const precalculate& p,
 		const grid_dims& gd, const vec& corner1, const vec& corner2, int seed,
 		const grid& user_grid, double cache_slope, const vec& cap,
-		bool display_progress)
+		bool display_progress, double budget)
 {
 	if (jobs.empty())
 		return;
@@ -771,7 +777,7 @@ void GpuDocking::dock_batch(std::vector<DockJob*>& jobs, const precalculate& p,
 		for (size_t j = start[d]; j < start[d + 1]; j++)
 			total_steps += (unsigned long) jobs[j]->par.num_tasks * split
 					* EngineBase::chain_steps(jobs[j]->par.mc.num_steps, split,
-							engines[d]->fraction_for(split));
+							engines[d]->fraction_for(split, budget));
 	}
 	unsigned* counter = 0;
 	ProgressPoller* poller = 0;
@@ -801,7 +807,7 @@ void GpuDocking::dock_batch(std::vector<DockJob*>& jobs, const precalculate& p,
 			{
 				e->prepare_docking(first, n, p, gd, user_grid, cache_slope);
 				e->dock_sub(first, n, p, corner1, corner2, seed, cache_slope, cap,
-						counter, tpc);
+						counter, tpc, budget);
 			} catch (std::exception& ex)
 			{
 				*err = ex.what();
