@@ -40,7 +40,8 @@ smina ... --minimize --gpu            # batched local optimization
 ```
 
 All other options work as usual. `--gpu_split N` sets `--fast`'s chain split
-by hand. Hidden options (`--help_hidden`): `--gpu_threads` (threads per
+by hand; `--fast` then runs half of smina's steps for N from 4 to 31 and all
+of them otherwise. Hidden options (`--help_hidden`): `--gpu_threads` (threads per
 search chain; chosen automatically), `--gpu_batch` (ligands per batch; chosen
 automatically), `--gpu_fp64` (double precision kernels, for validation), and
 `--fast`'s other components for experiments, `--gpu_qvina` (QuickVina 2's

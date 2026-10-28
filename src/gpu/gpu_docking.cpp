@@ -103,10 +103,12 @@ static int auto_split(size_t tasks, size_t capacity)
 
 // --fast (GpuSettings::step_fraction 0): half the steps once the GPU is
 // full (split below 32), where that halves the time; with fewer chains a
-// run is mostly fixed overhead, and the full search keeps its scores
+// run is mostly fixed overhead, and the full search keeps its scores.
+// Full steps also below split 4 (only from --gpu_split): longer chains do
+// not tolerate half of them (see auto_split).
 static double auto_fraction(int split)
 {
-	return split >= 32 ? 1.0 : 0.5;
+	return split >= 4 && split < 32 ? 0.5 : 1.0;
 }
 
 struct EngineBase

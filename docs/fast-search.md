@@ -90,7 +90,8 @@ screens part of the gain.
   more evaluations: 19% more at split 8. Measured on the 840-ligand screen
   on one GPU: split 1 with the check takes 48.9 s, split 4 51.9 s.
 - **Half the steps need a split of at least 4.** With split 1, screen top
-  scores drift (s.d. 0.124, one ligand more than 1 kcal/mol worse).
+  scores drift (s.d. 0.124, one ligand more than 1 kcal/mol worse), so
+  `--fast` keeps all the steps when `--gpu_split` sets a split below 4.
 - **Host work in parallel:** finishing screened ligands (final scoring,
   clustering) now runs on all host threads, with output unchanged.
 
