@@ -38,7 +38,21 @@ struct ChainInput
 	MTState rng;
 	unsigned num_steps; // per-ligand search length (0: params.num_steps)
 	unsigned maxiters; // per-ligand bfgs iterations (0: params.min.maxiters)
-	ChainInput() : model(0), num_steps(0), maxiters(0) {}
+	int unit; // the parallel_mc task the chain belongs to (EarlyStop)
+	ChainInput() : model(0), num_steps(0), maxiters(0), unit(0) {}
+};
+
+// Not smina's search (--fast): stop a ligand's chains once enough of its
+// exhaustiveness units (ChainInput::unit) agree on its best energy.  The
+// chains run in phases ending at first / checkpoints, (first + 1) /
+// checkpoints, ... of their steps; after every phase but the last, a ligand
+// with u >= 2 units stops when the best energies of at least
+// max(2, ceil(fraction * u)) of them are within eps of the ligand's best.
+struct EarlyStop
+{
+	int checkpoints, first;
+	double fraction, eps;
+	EarlyStop() : checkpoints(10), first(2), fraction(0.5), eps(0.05) {}
 };
 
 // a chain's output container, sorted by energy
@@ -77,13 +91,15 @@ Residency bfgs_residency();
 // monte_carlo::operator() for every chain, using the cache grids in ic.
 // progress, if given, counts completed MC steps (host-mapped).  With
 // threads_per_chain == 0 and the device's residency given, the threads per
-// chain are chosen for the chains (see mc_tpc).
+// chain are chosen for the chains (see mc_tpc), with early_stop for each of
+// its phases.
 template<typename T>
 void run_monte_carlo(const DeviceModels<T>& models,
 		const DeviceTables<T>& tables, const InterContext<T>& ic,
 		const MCParams& params, const std::vector<ChainInput>& chains,
 		std::vector<ChainResult>& results, unsigned* progress = 0,
-		int threads_per_chain = 32, const Residency* residency = 0);
+		int threads_per_chain = 32, const Residency* residency = 0,
+		const EarlyStop* early_stop = 0);
 
 // quasi_newton::operator() (bfgs) on every conf in place (one warp each);
 // returns the minimized energies.  Uses ic's back end (cache or non_cache).

@@ -916,6 +916,7 @@ Thank you!\n";
 		int gpu_split = 1;
 		double gpu_budget = 1;
 		bool gpu_qvina = false;
+		bool gpu_early_stop = false;
 		bool gpu_fast = false;
 		bool gpu_fp64 = false;
 		int gpu_ligands_per_batch = 0;
@@ -1037,6 +1038,8 @@ Thank you!\n";
 				"Ligands docked together on the GPU (0 chooses automatically)")
 		("gpu_qvina", bool_switch(&gpu_qvina),
 				"Skip local optimizations that QuickVina 2's history check deems redundant (not smina's search; for experiments)")
+		("gpu_early_stop", bool_switch(&gpu_early_stop),
+				"Stop a ligand's search once half of its exhaustiveness units agree on its best energy (not smina's search; for experiments)")
 		("gpu_budget", value<double>(&gpu_budget)->default_value(1),
 				"Fraction of smina's Monte Carlo steps to run on the GPU (not smina's search unless 1; for experiments)")
 #endif
@@ -1379,10 +1382,12 @@ Thank you!\n";
 				throw usage_error("--gpu_budget must be positive");
 			gs.step_fraction = gpu_budget;
 			gs.skip_visited = gpu_qvina;
+			gs.early_stop = gpu_early_stop;
 			if (gpu_fast)
 			{
 				// explicit --gpu_split / --gpu_budget take precedence
 				gs.skip_visited = true;
+				gs.early_stop = true;
 				if (vm["gpu_split"].defaulted())
 					gs.chain_split = 0; // automatic
 				if (vm["gpu_budget"].defaulted())

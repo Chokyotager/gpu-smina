@@ -119,9 +119,12 @@ struct EngineBase
 	int chain_split; // GpuSettings::chain_split (0: automatic)
 	double step_fraction; // GpuSettings::step_fraction (0: automatic)
 	bool skip_visited; // GpuSettings::skip_visited
+	bool early_stop; // GpuSettings::early_stop
+	EarlyStop stop_rule;
+	bool stop_env; // stop_rule set by GPU_EARLY_STOP
 	explicit EngineBase(int d) :
 			device(d), sm_count(1), chain_split(1), step_fraction(1),
-					skip_visited(false)
+					skip_visited(false), early_stop(false), stop_env(false)
 	{
 		cudaDeviceProp prop;
 		cuda_check(cudaSetDevice(device), "cudaSetDevice");
@@ -163,6 +166,16 @@ struct EngineBase
 	{
 		return step_fraction > 0 ? step_fraction : auto_fraction(split);
 	}
+	// the early stopping rule for chains of `split`: checks after every
+	// tenth of smina's steps the chains run, from the second on
+	EarlyStop stop_for(int split) const
+	{
+		EarlyStop r = stop_rule;
+		if (!stop_env)
+			r.checkpoints = std::max(r.first + 1,
+					int(std::lround(10 * fraction_for(split))));
+		return r;
+	}
 
 	// chains per search task when this device docks `tasks` tasks at once
 	int split_for(size_t tasks) const
@@ -186,6 +199,7 @@ struct EngineBase
 					::random_int(0, 1000000, generator), corner1, corner2);
 			c.num_steps = chain_steps(mp.num_steps, split, fraction_for(split));
 			c.maxiters = mp.min.maxiters;
+			c.unit = int(i / split);
 			chains.push_back(c);
 		}
 	}
@@ -357,10 +371,11 @@ struct Engine: public EngineBase
 					* chain_steps(par.mc.num_steps, split, fraction_for(split)));
 		}
 		std::vector<ChainResult> results;
+		const EarlyStop es = stop_for(split);
 		try
 		{
 			run_monte_carlo(models, tables, context(true, cache_slope), prm,
-					chains, results, counter, tpc, &mc_res);
+					chains, results, counter, tpc, &mc_res, early_stop ? &es : 0);
 		} catch (...)
 		{
 			delete poller;
@@ -541,8 +556,9 @@ void Engine<T>::dock_sub(GpuDocking::DockJob* const* jobs, size_t njobs,
 	MCParams prm = mc_params(jobs[0]->par.mc);
 	prm.visited = skip_visited;
 	std::vector<ChainResult> results;
+	const EarlyStop es = stop_for(split);
 	run_monte_carlo(models, tables, context(true, cache_slope), prm, chains,
-			results, progress, tpc, &mc_res);
+			results, progress, tpc, &mc_res, early_stop ? &es : 0);
 
 	// merge_output_containers per ligand
 	std::vector<output_type*> poses;
@@ -620,6 +636,15 @@ GpuDocking::GpuDocking(const GpuSettings& s) :
 		engines.back()->chain_split = std::max(0, settings.chain_split);
 		engines.back()->step_fraction = settings.step_fraction;
 		engines.back()->skip_visited = settings.skip_visited;
+		engines.back()->early_stop = settings.early_stop;
+		// GPU_EARLY_STOP="fraction,eps[,first,checkpoints]": test other rules
+		if (const char* env = getenv("GPU_EARLY_STOP"))
+		{
+			EarlyStop& r = engines.back()->stop_rule;
+			sscanf(env, "%lf,%lf,%d,%d", &r.fraction, &r.eps, &r.first,
+					&r.checkpoints);
+			engines.back()->stop_env = true;
+		}
 	}
 }
 

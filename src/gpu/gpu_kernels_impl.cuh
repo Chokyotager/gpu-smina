@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 
@@ -603,12 +604,65 @@ static std::vector<MCPhase> mc_phases(const std::vector<double>& work,
 	return phases;
 }
 
+// EarlyStop's rule after a phase: `items` ran in it, those continuing
+// (limits[c].w) saved their best energies.  Stopped ligands' chains count
+// their remaining steps as done for the progress display.
+template<typename T>
+static void stop_agreeing(const EarlyStop& es,
+		const std::vector<ChainInput>& chains, const std::vector<int>& items,
+		const std::vector<uint4>& limits, const DevBuf& dmem,
+		const ChainOffsets& co, const std::vector<unsigned>& steps,
+		const std::vector<unsigned>& done, std::vector<char>& stopped,
+		unsigned* progress)
+{
+	const int nchains = int(chains.size());
+	std::vector<T> saved(2 * size_t(nchains)); // resume_e: current, best
+	cuda_check(cudaMemcpy2D(&saved[0], 2 * sizeof(T),
+			dmem.get<T>() + co.resume_e, co.total * sizeof(T), 2 * sizeof(T),
+			nchains, cudaMemcpyDeviceToHost), "best energies");
+	// per ligand, its units' best energies
+	std::vector<std::vector<T> > unit_best(stopped.size());
+	for (size_t i = 0; i < items.size(); i++)
+	{
+		const int c = items[i];
+		if (!limits[c].w)
+			continue;
+		std::vector<T>& ub = unit_best[chains[c].model];
+		const size_t u = size_t(chains[c].unit);
+		if (ub.size() <= u)
+			ub.resize(u + 1, std::numeric_limits<T>::max());
+		ub[u] = std::min(ub[u], saved[2 * size_t(c) + 1]);
+	}
+	std::vector<char> now(stopped.size(), 0);
+	for (size_t m = 0; m < unit_best.size(); m++)
+	{
+		const std::vector<T>& ub = unit_best[m];
+		if (ub.size() < 2)
+			continue;
+		const T best = *std::min_element(ub.begin(), ub.end());
+		int agree = 0;
+		for (size_t u = 0; u < ub.size(); u++)
+			agree += (ub[u] - best <= T(es.eps));
+		const int need = std::max(2, int(std::ceil(es.fraction * ub.size()
+				- 1e-9)));
+		if (agree >= need)
+			stopped[m] = now[m] = 1;
+	}
+	unsigned long skipped = 0;
+	for (int c = 0; c < nchains; c++)
+		if (now[chains[c].model])
+			skipped += steps[c] - done[c];
+	if (progress && skipped)
+		__atomic_fetch_add(progress, unsigned(skipped), __ATOMIC_RELAXED);
+}
+
 template<typename T>
 void run_monte_carlo(const DeviceModels<T>& models,
 		const DeviceTables<T>& tables, const InterContext<T>& ic,
 		const MCParams& params, const std::vector<ChainInput>& chains,
 		std::vector<ChainResult>& results, unsigned* progress,
-		int threads_per_chain, const Residency* residency)
+		int threads_per_chain, const Residency* residency,
+		const EarlyStop* early_stop)
 {
 	const int nchains = int(chains.size());
 	results.assign(nchains, ChainResult());
@@ -690,19 +744,32 @@ void run_monte_carlo(const DeviceModels<T>& models,
 
 	// every phase resumes the unfinished chains where the previous one
 	// stopped: phase k runs chain c up to the first step at which its
-	// estimated work reaches phases[k].limit (one phase except in tests)
+	// estimated work reaches phases[k].limit (one phase except in tests);
+	// with early_stop, up to (first + k) / checkpoints of its steps, with
+	// the rule applied after every phase but the last: the chains of
+	// stopped ligands no longer run
+	const int es_n = early_stop ? std::max(1, early_stop->checkpoints) : 1;
+	const int es_first = early_stop ? std::min(es_n, std::max(1,
+			early_stop->first)) : 1;
+	const size_t nphases = early_stop ? size_t(es_n - es_first + 1)
+			: phases.size();
+	std::vector<char> stopped(models.host_desc.size(), 0);
 	std::vector<unsigned> done(nchains, 0);
 	std::vector<uint4> limits(nchains);
-	for (size_t ph = 0; ph < phases.size(); ph++)
+	for (size_t ph = 0; ph < nphases; ph++)
 	{
 		std::vector<int> items, item_model;
 		std::vector<double> cost;
 		for (int c = 0; c < nchains; c++)
 		{
+			if (stopped[cmodel[c]])
+				continue;
 			unsigned end = steps[c];
-			if (ph + 1 < phases.size())
-				end = unsigned(std::min<double>(steps[c],
-						std::ceil(phases[ph].limit / step_cost[c])));
+			if (ph + 1 < nphases)
+				end = early_stop ? unsigned((steps[c] * (unsigned long long)(
+						es_first + ph) + es_n - 1) / es_n)
+						: unsigned(std::min<double>(steps[c],
+								std::ceil(phases[ph].limit / step_cost[c])));
 			if (end <= done[c])
 				continue;
 			limits[c] = make_uint4(done[c], end, maxiters[c], end < steps[c]);
@@ -715,7 +782,9 @@ void run_monte_carlo(const DeviceModels<T>& models,
 			continue;
 		dlimits.upload(&limits[0], sizeof(uint4) * nchains);
 		ditems.upload(&items[0], sizeof(int) * items.size());
-		const int tpc = phases[ph].tpc;
+		const int tpc = !early_stop ? phases[ph].tpc : threads_per_chain > 0
+				? threads_per_chain : residency ? mc_tpc(*residency, items.size())
+				: 32;
 		const auto phase_t0 = std::chrono::steady_clock::now();
 		if (tpc >= 256)
 			launch_monte_carlo<T, 256>(models, item_model, tables, ic, params, so,
@@ -733,6 +802,9 @@ void run_monte_carlo(const DeviceModels<T>& models,
 			fprintf(stderr, "phase %d: %zu chains, %d threads, %.2f s\n", int(ph),
 					items.size(), tpc, std::chrono::duration<double>(
 							std::chrono::steady_clock::now() - phase_t0).count());
+		if (early_stop && ph + 1 < nphases)
+			stop_agreeing<T>(*early_stop, chains, items, limits, dmem, co, steps,
+					done, stopped, progress);
 	}
 #ifdef GPU_PROFILE
 	report_profile();
@@ -1119,7 +1191,7 @@ template void run_monte_carlo<GPU_PRECISION>(
 		const DeviceModels<GPU_PRECISION>&, const DeviceTables<GPU_PRECISION>&,
 		const InterContext<GPU_PRECISION>&, const MCParams&,
 		const std::vector<ChainInput>&, std::vector<ChainResult>&, unsigned*,
-		int, const Residency*);
+		int, const Residency*, const EarlyStop*);
 template bool run_bfgs<GPU_PRECISION>(const DeviceModels<GPU_PRECISION>&,
 		const DeviceTables<GPU_PRECISION>&, const InterContext<GPU_PRECISION>&,
 		const MinParams&, const double[3], const std::vector<int>&,

@@ -33,8 +33,12 @@ struct GpuSettings
 	// not smina's search: QuickVina 2's check skips local optimizations
 	// that would revisit known minima
 	bool skip_visited;
+	// not smina's search: stop a ligand once its exhaustiveness units agree
+	// on its best energy (EarlyStop); with automatic step_fraction, every
+	// ligand may then run all of smina's steps
+	bool early_stop;
 	GpuSettings() : fp64(false), threads_per_chain(0), chain_split(1),
-			step_fraction(1), skip_visited(false) {}
+			step_fraction(1), skip_visited(false), early_stop(false) {}
 };
 
 // parse "0,1" into device ordinals
