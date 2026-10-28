@@ -8,12 +8,14 @@ step counts, seeding and parameters are those of CPU smina. Without `--gpu`
 the program behaves exactly as before.
 
 `--fast` additionally offers a GPU-style search that is *not* smina's: it
-skips local optimizations that QuickVina 2's history check deems redundant,
-splits every Monte Carlo chain into several shorter concurrent ones and, on
-screens, runs half of smina's steps. It docks a single complex 8-20 times
-faster than the 1:1 port and screens 2-4 times faster, with the same
-redocking success and screening scores as CPU smina (see below and
-[docs/fast-search.md](docs/fast-search.md)).
+skips local optimizations that QuickVina 2's history check deems redundant
+and splits every Monte Carlo chain into several shorter concurrent ones. On
+screens it also runs at most half of smina's steps, stops a ligand once its
+runs agree on its best score, and gives the full search only to the ligands
+that a quick first pass ranks near the top. It docks a single complex 8-20
+times faster than the 1:1 port and screens 4-7 times faster. Redocking
+success and the top of a screen's ranking match CPU smina within its
+run-to-run noise (see below and [docs/fast-search.md](docs/fast-search.md)).
 
 ## Building
 
@@ -39,13 +41,18 @@ smina ... --gpu --fast                # GPU-style search (not 1:1, see below)
 smina ... --minimize --gpu            # batched local optimization
 ```
 
-All other options work as usual. `--gpu_split N` sets `--fast`'s chain split
-by hand; `--fast` then runs half of smina's steps for N from 4 to 31 and all
-of them otherwise. Hidden options (`--help_hidden`): `--gpu_threads` (threads per
-search chain; chosen automatically), `--gpu_batch` (ligands per batch; chosen
-automatically), `--gpu_fp64` (double precision kernels, for validation), and
-`--fast`'s other components for experiments, `--gpu_qvina` (QuickVina 2's
-check) and `--gpu_budget F` (fraction of smina's steps).
+All other options work as usual. `--fast_top F` (default 0.1) sets the
+fraction of a screen's ligands that get the full search; `--fast_top 1`
+gives it to every ligand. `--gpu_split N` sets `--fast`'s chain split by
+hand; `--fast` then runs half of smina's steps and stops ligands early for N
+from 4 to 31, and runs all of them otherwise. Hidden options
+(`--help_hidden`): `--gpu_threads` (threads per search chain; chosen
+automatically), `--gpu_batch` (ligands per batch; chosen automatically),
+`--gpu_fp64` (double precision kernels, for validation), and `--fast`'s
+components for experiments: `--gpu_qvina` (QuickVina 2's check),
+`--gpu_budget F` (fraction of smina's steps), `--gpu_early_stop`, and
+`--fast_first` / `--fast_top_margin` (the first pass's budget and the
+margin of the selection).
 
 What runs where:
 
@@ -102,13 +109,19 @@ not depend on it.
   described below is excluded (`GPU_TEST_FULL_CELLS`), 1888/1890 with it.
 * **`--fast`**, the same 25 Astex complexes × 5 seeds: 93/125 (74.4%), mean
   top score −9.838 kcal/mol; against the CPU (92/125, −9.835), +1 success
-  (permutation p = 1.00) and −0.003 kcal/mol (p = 0.79). Its screening forms,
-  splits 8 and 16 with half the steps, redock within noise as well: 90 and
-  92/125, top scores +0.010 and +0.024 kcal/mol (p ≥ 0.13). On the
-  210-ligand screen (split 4 on one GPU, 8 on two), top scores differ from the
-  CPU's by s.d. 0.083 (one GPU) and 0.081 kcal/mol (two GPUs), means within
-  0.002; two CPU runs with different seeds differ by 0.073. Validated with
-  rigid receptors and the default scoring function.
+  (permutation p = 1.00) and −0.003 kcal/mol (p = 0.79). Its screening form,
+  split 8 with half the steps and early stopping, redocks within noise as
+  well: 92/125, top score +0.018 kcal/mol (p = 0.16). On the 210-ligand
+  screen with every ligand fully searched (`--fast_top 1`), top scores
+  differ from the CPU's by s.d. 0.085 (one GPU) and 0.088 kcal/mol (two
+  GPUs); two CPU runs with different seeds differ by 0.073. With two-pass
+  screening (the default), the CPU's top 10, 21 and 42 ligands are among
+  `--fast`'s top 10, 21 and 42 about as often as with one pass (seeds 1-4:
+  34/40, 76/84, 165/168, against 36/40, 77/84, 165/168; the CPU with another
+  seed: 9/10, 19/21, 42/42), and no ligand of the CPU's top 10% scores more
+  than 0.5 kcal/mol worse; ligands outside the top keep first-pass scores
+  (all ligands: s.d. 0.11-0.14 kcal/mol). Validated with rigid receptors and the
+  default scoring function.
 
 Tools: `src/gpu/tests/gpu_eval_test` (grids and evaluations),
 `src/gpu/tests/gpu_mc_test` (trajectories, `--minimize`, determinism,
@@ -133,8 +146,8 @@ clock times including input and output.
 | … exhaustiveness 128 | 173 s (`--cpu 32`) | 47 s | 5.7 s |
 | Astex set, exhaustiveness 8, per complex | | 16.8 s | 1.5 s |
 | 1HSG, flexible residues A:50 and B:50, exhaustiveness 8 | 41 s (`--cpu 8`) | 48 s | 1.2 s (not validated) |
-| screening 210 ligands (1HSG box, exhaustiveness 8): one GPU / both | 236 s (32 single-threaded processes) | 32 s / 19.5 s | 7.9 s / 5.4 s |
-| screening 840 ligands (the 210, four times): one GPU / both | not measured | 57 s / 47 s | 28.6 s / 16.9 s |
+| screening 210 ligands (1HSG box, exhaustiveness 8): one GPU / both | 236 s (32 single-threaded processes) | 32 s / 19.5 s | 4.5 s / 4.8 s |
+| screening 840 ligands (the 210, four times): one GPU / both | not measured | 57 s / 47 s | 13.3 s / 8.8 s |
 | `--minimize`, 1890 docked poses | 0.47 s (32 processes), 4.8 s (1 process) | 2.3 s | |
 | `--minimize`, 1890 random poses | 4.4 s (32 processes), 49 s (1 process) | 13 s | |
 
@@ -174,9 +187,18 @@ chosen per batch, the largest power of two from 4 to 32 that keeps a GPU's
 chains within 4 waves (32 for a single complex, 4 or 8 for the screens
 above), because shorter chains need more evaluations for the same steps.
 Once the GPU is full (split below 32), half of smina's steps are run, which
-halves a screen's time; a single complex's run is mostly fixed overhead, so
-it keeps the full budget. Budgets of ⅛ and below, like Uni-Dock's (about
-1-8% of smina's steps), cost redocking success and top scores.
+halves a screen's time, and a ligand stops once half of its exhaustiveness
+units agree on its best energy within 0.05 kcal/mol (checked after every
+tenth of smina's steps from the second on, as resumed phases, so results
+stay reproducible): on the traces of the 210-ligand screen, ligands then
+run 28% of smina's steps on average instead of 50%. A single complex's run is mostly fixed overhead, so
+it keeps the full budget and no checkpoints. Budgets of ⅛ and below, like
+Uni-Dock's (about 1-8% of smina's steps), cost redocking success and top
+scores; but ranking a screen needs the full search only near the top, so a
+screen of 20 or more ligands first docks every ligand with 1/16 of smina's
+steps and searches fully only those within 0.3 kcal/mol of the best 10%
+so far (about 20% of the ligands). Giving up local optimizations of moves
+that the Metropolis test will reject was tried and gained nothing.
 [docs/fast-search.md](docs/fast-search.md) has the measurements.
 
 `--minimize` gains nothing over a multi-core CPU. Minimizing a docked pose
